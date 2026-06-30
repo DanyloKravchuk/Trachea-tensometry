@@ -7,5 +7,10 @@ Rplots.pdf
 .agents/
 .codex/
 
-data/
-figs/
+data/*
+!data/09.2025/
+!data/09.2025/**
+
+figs/*
+!figs/2025/
+!figs/2025/**

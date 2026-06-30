@@ -495,11 +495,56 @@ make_mean_curve <- function(curves, time_col, value_col, max_points = 5000,
     approx(d[[time_col]], d[[value_col]], xout = grid, rule = 1, ties = mean)$y
   })
   if (is.null(dim(mat))) mat <- matrix(mat, ncol = 1)
+  n <- rowSums(is.finite(mat))
+  sd <- apply(mat, 1, stats::sd, na.rm = TRUE)
+  sem <- sd / sqrt(n)
+  ci_mult <- stats::qt(0.975, df = pmax(n - 1, 1))
+  ci_mult[n < 2] <- NA_real_
+  ci_low <- rowMeans(mat, na.rm = TRUE) - ci_mult * sem
+  ci_high <- rowMeans(mat, na.rm = TRUE) + ci_mult * sem
 
   data.frame(
     TimeRubi = grid,
     Mean = rowMeans(mat, na.rm = TRUE),
-    N = rowSums(is.finite(mat))
+    SD = sd,
+    SEM = sem,
+    CI_low = ci_low,
+    CI_high = ci_high,
+    N = n
+  )
+}
+
+make_independent_mean_delta <- function(light_d, no_light_d, grid) {
+  interp <- function(d, col) {
+    approx(d$TimeRubi, d[[col]], xout = grid, rule = 1, ties = mean)$y
+  }
+
+  light_mean <- interp(light_d, "Mean")
+  no_light_mean <- interp(no_light_d, "Mean")
+  light_sem <- interp(light_d, "SEM")
+  no_light_sem <- interp(no_light_d, "SEM")
+  light_n <- interp(light_d, "N")
+  no_light_n <- interp(no_light_d, "N")
+
+  sem_delta <- sqrt(light_sem^2 + no_light_sem^2)
+  df_delta <- sem_delta^4 / (
+    (light_sem^4 / pmax(light_n - 1, 1)) +
+      (no_light_sem^4 / pmax(no_light_n - 1, 1))
+  )
+  df_delta[!is.finite(df_delta)] <- NA_real_
+  ci_mult <- stats::qt(0.975, df = df_delta)
+  ci_low <- light_mean - no_light_mean - ci_mult * sem_delta
+  ci_high <- light_mean - no_light_mean + ci_mult * sem_delta
+
+  data.frame(
+    TimeRubi = grid,
+    Mean = light_mean - no_light_mean,
+    SEM = sem_delta,
+    CI_low = ci_low,
+    CI_high = ci_high,
+    N_light = light_n,
+    N_no_light = no_light_n,
+    Condition = "rubi_light - rubi_no_light"
   )
 }
 
@@ -718,6 +763,16 @@ condition_color_scale <- function(...) {
     labels = condition_label,
     name = NULL,
     guide = ggplot2::guide_legend(ncol = 2, byrow = TRUE),
+    ...
+  )
+}
+
+condition_fill_scale <- function(...) {
+  ggplot2::scale_fill_manual(
+    values = condition_colors,
+    labels = condition_label,
+    name = NULL,
+    guide = "none",
     ...
   )
 }
@@ -2163,6 +2218,13 @@ rubi_light_plot_data <- thin_plot_data(
 p_rubi_light_norm <- ggplot(rubi_light_plot_data, aes(TimeRubi, TraceNormKCl0, group = Curve)) +
   light_band_layer() +
   geom_line(alpha = 0.35, linewidth = 0.55, color = condition_color("rubi_light")) +
+  geom_ribbon(
+    data = rubi_light_mean,
+    aes(TimeRubi, ymin = CI_low, ymax = CI_high),
+    inherit.aes = FALSE,
+    fill = "grey35",
+    alpha = 0.18
+  ) +
   geom_line(data = rubi_light_mean, aes(TimeRubi, Mean),
             inherit.aes = FALSE, color = "black", linewidth = 1.25) +
   labs(
@@ -2306,6 +2368,13 @@ p_rubi_light_clusters_individual <- ggplot(
 ) +
   light_band_layer() +
   geom_line(alpha = 0.45, linewidth = 0.6) +
+  geom_ribbon(
+    data = rubi_light_clusters_3$mean,
+    aes(TimeRubi, ymin = CI_low, ymax = CI_high, fill = ClusterLabel),
+    inherit.aes = FALSE,
+    alpha = 0.16,
+    color = NA
+  ) +
   geom_line(
     data = rubi_light_clusters_3$mean,
     aes(TimeRubi, Mean, color = ClusterLabel),
@@ -2313,6 +2382,7 @@ p_rubi_light_clusters_individual <- ggplot(
     linewidth = 1.4
   ) +
   scale_color_manual(values = cluster_colors_3, name = NULL) +
+  scale_fill_manual(values = cluster_colors_3, guide = "none") +
   labs(
     title = "Опромінений RuBi-Nicotine: перевірка 3 підгруп",
     subtitle = "Тонкі лінії - окремі криві; товсті лінії - середні по підгрупах",
@@ -2327,8 +2397,14 @@ p_rubi_light_cluster_means_2 <- ggplot(
   aes(TimeRubi, Mean, color = ClusterLabel)
 ) +
   light_band_layer() +
+  geom_ribbon(
+    aes(ymin = CI_low, ymax = CI_high, fill = ClusterLabel),
+    alpha = 0.18,
+    color = NA
+  ) +
   geom_line(linewidth = 1.4) +
   scale_color_manual(values = cluster_colors_2, name = NULL) +
+  scale_fill_manual(values = cluster_colors_2, guide = "none") +
   labs(
     title = "Опромінений RuBi-Nicotine: середні криві 2 підгруп",
     x = "Час від початку відповіді, с",
@@ -2342,8 +2418,14 @@ p_rubi_light_cluster_means_3 <- ggplot(
   aes(TimeRubi, Mean, color = ClusterLabel)
 ) +
   light_band_layer() +
+  geom_ribbon(
+    aes(ymin = CI_low, ymax = CI_high, fill = ClusterLabel),
+    alpha = 0.18,
+    color = NA
+  ) +
   geom_line(linewidth = 1.4) +
   scale_color_manual(values = cluster_colors_3, name = NULL) +
+  scale_fill_manual(values = cluster_colors_3, guide = "none") +
   labs(
     title = "Опромінений RuBi-Nicotine: середні криві 3 підгруп",
     x = "Час від початку відповіді, с",
@@ -2472,6 +2554,13 @@ rubi_no_light_plot_data <- thin_plot_data(
 p_rubi_no_light_norm <- ggplot(rubi_no_light_plot_data, aes(TimeRubi, TraceNormKCl0, group = Curve)) +
   light_band_layer() +
   geom_line(alpha = 0.35, linewidth = 0.55, color = condition_color("rubi_no_light")) +
+  geom_ribbon(
+    data = rubi_no_light_mean,
+    aes(TimeRubi, ymin = CI_low, ymax = CI_high),
+    inherit.aes = FALSE,
+    fill = "grey35",
+    alpha = 0.18
+  ) +
   geom_line(data = rubi_no_light_mean, aes(TimeRubi, Mean),
             inherit.aes = FALSE, color = "black", linewidth = 1.25) +
   labs(
@@ -2521,8 +2610,14 @@ make_light_cluster_vs_no_light_mean_plots <- function(light_clusters,
 
     ggplot(d, aes(TimeRubi, Mean, color = Condition)) +
       light_band_layer() +
+      geom_ribbon(
+        aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+        alpha = 0.16,
+        color = NA
+      ) +
       geom_line(linewidth = 1.45) +
       condition_color_scale(breaks = c("rubi_light", "rubi_no_light")) +
+      condition_fill_scale(breaks = c("rubi_light", "rubi_no_light")) +
       labs(
         title = paste0("Підгрупа опроміненого RuBi-Nicotine: ", cluster_label),
         subtitle = paste0(
@@ -2558,15 +2653,9 @@ make_light_cluster_delta_vs_no_light_mean_plots <- function(light_clusters,
     if (!is.finite(dt) || dt <= 0 || end_time <= start_time) return(NULL)
 
     grid <- seq(start_time, end_time, by = dt)
-    light_y <- approx(light_d$TimeRubi, light_d$Mean,
-                      xout = grid, rule = 1, ties = mean)$y
-    no_light_y <- approx(no_light_d$TimeRubi, no_light_d$Mean,
-                         xout = grid, rule = 1, ties = mean)$y
-    delta_d <- data.frame(
-      TimeRubi = grid,
-      Delta = light_y - no_light_y,
-      ClusterLabel = cluster_label
-    )
+    delta_d <- make_independent_mean_delta(light_d, no_light_d, grid)
+    delta_d$Delta <- delta_d$Mean
+    delta_d$ClusterLabel <- cluster_label
 
     n_light <- light_clusters$features %>%
       dplyr::filter(ClusterLabel == cluster_label) %>%
@@ -2577,6 +2666,12 @@ make_light_cluster_delta_vs_no_light_mean_plots <- function(light_clusters,
     ggplot(delta_d, aes(TimeRubi, Delta)) +
       light_band_layer() +
       geom_hline(yintercept = 0, color = "grey75", linewidth = 0.5) +
+      geom_ribbon(
+        aes(ymin = CI_low, ymax = CI_high),
+        fill = condition_color("rubi_light - rubi_no_light"),
+        alpha = 0.14,
+        color = NA
+      ) +
       geom_line(color = condition_color("rubi_light - rubi_no_light"),
                 linewidth = 1.35) +
       labs(
@@ -2585,7 +2680,7 @@ make_light_cluster_delta_vs_no_light_mean_plots <- function(light_clusters,
           n_clusters,
           " підгрупи; n опроміненого = ", n_light,
           ", n неопроміненого = ", n_no_light,
-          "; Δ = опромінений - неопромінений"
+          "; Δ = опромінений - неопромінений; CI через поширення SEM незалежних середніх"
         ),
         x = "Час від початку відповіді, с",
         y = "Δ середньої нормованої відповіді"
@@ -2626,28 +2721,28 @@ for (p in rubi_light_cluster_delta_vs_no_light_mean_plots_3) print(p)
 for (nm in names(rubi_light_cluster_vs_no_light_mean_plots_2)) {
   save_group_plot(
     rubi_light_cluster_vs_no_light_mean_plots_2[[nm]],
-    "rubi_comparison",
+    "rubi_comparison/2_subgroups",
     paste0("rubi_light_subgroup_vs_no_light_mean_2_groups_", nm)
   )
 }
 for (nm in names(rubi_light_cluster_vs_no_light_mean_plots_3)) {
   save_group_plot(
     rubi_light_cluster_vs_no_light_mean_plots_3[[nm]],
-    "rubi_comparison",
+    "rubi_comparison/3_subgroups",
     paste0("rubi_light_subgroup_vs_no_light_mean_3_groups_", nm)
   )
 }
 for (nm in names(rubi_light_cluster_delta_vs_no_light_mean_plots_2)) {
   save_group_plot(
     rubi_light_cluster_delta_vs_no_light_mean_plots_2[[nm]],
-    "rubi_comparison",
+    "rubi_comparison/2_subgroups",
     paste0("rubi_light_subgroup_minus_no_light_mean_delta_2_groups_", nm)
   )
 }
 for (nm in names(rubi_light_cluster_delta_vs_no_light_mean_plots_3)) {
   save_group_plot(
     rubi_light_cluster_delta_vs_no_light_mean_plots_3[[nm]],
-    "rubi_comparison",
+    "rubi_comparison/3_subgroups",
     paste0("rubi_light_subgroup_minus_no_light_mean_delta_3_groups_", nm)
   )
 }
@@ -2841,6 +2936,13 @@ p_paired_rubi_delta <- ggplot(
   geom_hline(yintercept = 0, color = "grey70", linewidth = 0.5) +
   geom_line(color = condition_color("rubi_light - rubi_no_light"),
             linewidth = 0.9, alpha = 0.55) +
+  geom_ribbon(
+    data = paired_rubi_delta_mean,
+    aes(TimeRubi, ymin = CI_low, ymax = CI_high),
+    inherit.aes = FALSE,
+    fill = "grey35",
+    alpha = 0.18
+  ) +
   geom_line(data = paired_rubi_delta_mean, aes(TimeRubi, Mean),
             inherit.aes = FALSE, color = "black", linewidth = 1.35) +
   labs(
@@ -2860,12 +2962,12 @@ print(p_paired_rubi_delta)
 
 save_group_plot(
   p_paired_rubi_curves,
-  "rubi_comparison",
+  "rubi_comparison/1_no_subgroups",
   "paired_rubi_light_vs_no_light_prelight_aligned_curves"
 )
 save_group_plot(
   p_paired_rubi_delta,
-  "rubi_comparison",
+  "rubi_comparison/1_no_subgroups",
   "paired_rubi_light_minus_no_light_prelight_aligned_delta"
 )
 ```
@@ -2904,8 +3006,14 @@ rubi_no_light_n <- dplyr::n_distinct(rubi_no_light_norm$Curve)
 
 p_rubi_light_vs_no_light_mean <- ggplot(rubi_mean_both, aes(TimeRubi, Mean, color = Condition)) +
   light_band_layer() +
+  geom_ribbon(
+    aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+    alpha = 0.16,
+    color = NA
+  ) +
   geom_line(linewidth = 1.25) +
   condition_color_scale(breaks = c("rubi_no_light", "rubi_light")) +
+  condition_fill_scale(breaks = c("rubi_no_light", "rubi_light")) +
   labs(
     title = "Середні криві опроміненого і неопроміненого RuBi-Nicotine",
     subtitle = paste(
@@ -2923,7 +3031,7 @@ p_rubi_light_vs_no_light_mean <- ggplot(rubi_mean_both, aes(TimeRubi, Mean, colo
 print(p_rubi_light_vs_no_light_mean)
 save_group_plot(
   p_rubi_light_vs_no_light_mean,
-  "rubi_comparison",
+  "rubi_comparison/1_no_subgroups",
   "rubi_light_vs_rubi_no_light_mean"
 )
 ```
@@ -2992,6 +3100,8 @@ nic_mean_at_light_band <- nic_mean %>%
   dplyr::transmute(
     TimeRubi = TimeFromOnset - nic_rise_onset_for_light_band + 420,
     Mean,
+    CI_low,
+    CI_high,
     Condition = "nic mean"
   )
 
@@ -3003,6 +3113,13 @@ add_nicotine_to_delta_plot <- function(plot, delta_data, delta_time_col = "TimeR
     )
 
   plot +
+    ggplot2::geom_ribbon(
+      data = nic_plot_data,
+      ggplot2::aes(TimeRubi, ymin = CI_low, ymax = CI_high),
+      inherit.aes = FALSE,
+      fill = condition_color("nic mean"),
+      alpha = 0.12
+    ) +
     ggplot2::geom_line(
       data = nic_plot_data,
       ggplot2::aes(TimeRubi, Mean),
@@ -3019,9 +3136,11 @@ make_delta_nic_data <- function(delta_data,
   delta_plot_data <- data.frame(
     TimeRubi = delta_data[[delta_time_col]],
     Mean = delta_data[[delta_value_col]],
+    CI_low = if ("CI_low" %in% names(delta_data)) delta_data$CI_low else NA_real_,
+    CI_high = if ("CI_high" %in% names(delta_data)) delta_data$CI_high else NA_real_,
     Condition = "rubi_light - rubi_no_light"
   )
-  nic_plot_data <- nic_mean_at_light_band[, c("TimeRubi", "Mean", "Condition")]
+  nic_plot_data <- nic_mean_at_light_band[, c("TimeRubi", "Mean", "CI_low", "CI_high", "Condition")]
   out <- dplyr::bind_rows(delta_plot_data, nic_plot_data)
 
   common_start <- max(
@@ -3078,6 +3197,13 @@ p_nic_records <- ggplot(
   aes(TimeFromOnset, TraceNormKCl0, group = Curve)
 ) +
   geom_line(alpha = 0.55, linewidth = 0.65, color = condition_color("nic")) +
+  geom_ribbon(
+    data = nic_mean,
+    aes(TimeFromOnset, ymin = CI_low, ymax = CI_high),
+    inherit.aes = FALSE,
+    fill = "grey35",
+    alpha = 0.18
+  ) +
   geom_line(
     data = nic_mean,
     aes(TimeFromOnset, Mean),
@@ -3132,10 +3258,10 @@ no_light_on_difference_grid <- approx(
   ties = mean
 )$y
 
-rubi_difference <- data.frame(
-  TimeRubi = difference_grid,
-  Mean = light_on_difference_grid - no_light_on_difference_grid,
-  Condition = "rubi_light - rubi_no_light"
+rubi_difference <- make_independent_mean_delta(
+  rubi_light_mean,
+  rubi_no_light_mean,
+  difference_grid
 )
 
 rubi_light_no_light_difference <- dplyr::bind_rows(
@@ -3158,6 +3284,14 @@ p_rubi_light_no_light_difference <- ggplot(
 ) +
   light_band_layer() +
   geom_hline(yintercept = 0, color = "grey75", linewidth = 0.4) +
+  geom_ribbon(
+    data = rubi_difference,
+    aes(TimeRubi, ymin = CI_low, ymax = CI_high),
+    inherit.aes = FALSE,
+    fill = condition_color("rubi_light - rubi_no_light"),
+    alpha = 0.12,
+    color = NA
+  ) +
   geom_line(linewidth = 1.2) +
   condition_color_scale(
     breaks = c("rubi_light", "rubi_no_light", "rubi_light - rubi_no_light")
@@ -3167,7 +3301,7 @@ p_rubi_light_no_light_difference <- ggplot(
     subtitle = paste0(
       "n опроміненого = ", dplyr::n_distinct(rubi_light_norm$Curve),
       "; n неопроміненого = ", dplyr::n_distinct(rubi_no_light_norm$Curve),
-      "; Δ = опромінений - неопромінений"
+      "; Δ = опромінений - неопромінений; CI Δ через поширення SEM незалежних середніх"
     ),
     x = "Час від початку вікна відповіді, с",
     y = "Середня нормована відповідь"
@@ -3178,6 +3312,12 @@ p_rubi_light_no_light_difference <- ggplot(
 p_rubi_mean_delta_only <- ggplot(rubi_difference, aes(TimeRubi, Mean)) +
   light_band_layer() +
   geom_hline(yintercept = 0, color = "grey75", linewidth = 0.5) +
+  geom_ribbon(
+    aes(ymin = CI_low, ymax = CI_high),
+    fill = condition_color("rubi_light - rubi_no_light"),
+    alpha = 0.14,
+    color = NA
+  ) +
   geom_line(color = condition_color("rubi_light - rubi_no_light"),
             linewidth = 1.35) +
   labs(
@@ -3185,7 +3325,7 @@ p_rubi_mean_delta_only <- ggplot(rubi_difference, aes(TimeRubi, Mean)) +
     subtitle = paste0(
       "n опроміненого = ", dplyr::n_distinct(rubi_light_norm$Curve),
       "; n неопроміненого = ", dplyr::n_distinct(rubi_no_light_norm$Curve),
-      "; Δ = опромінений - неопромінений; nicotine пунктиром, підйом на 420 с"
+      "; Δ = опромінений - неопромінений; CI через поширення SEM незалежних середніх; nicotine пунктиром"
     ),
     x = "Час від початку відповіді, с",
     y = "Δ середньої нормованої відповіді"
@@ -3227,15 +3367,9 @@ make_light_cluster_delta_with_nic_plots <- function(light_clusters,
     if (!is.finite(dt) || dt <= 0 || end_time <= start_time) return(NULL)
 
     grid <- seq(start_time, end_time, by = dt)
-    light_y <- approx(light_d$TimeRubi, light_d$Mean,
-                      xout = grid, rule = 1, ties = mean)$y
-    no_light_y <- approx(no_light_d$TimeRubi, no_light_d$Mean,
-                         xout = grid, rule = 1, ties = mean)$y
-    delta_d <- data.frame(
-      TimeRubi = grid,
-      Delta = light_y - no_light_y,
-      ClusterLabel = cluster_label
-    )
+    delta_d <- make_independent_mean_delta(light_d, no_light_d, grid)
+    delta_d$Delta <- delta_d$Mean
+    delta_d$ClusterLabel <- cluster_label
 
     n_light <- light_clusters$features %>%
       dplyr::filter(ClusterLabel == cluster_label) %>%
@@ -3246,6 +3380,12 @@ make_light_cluster_delta_with_nic_plots <- function(light_clusters,
     p <- ggplot(delta_d, aes(TimeRubi, Delta)) +
       light_band_layer() +
       geom_hline(yintercept = 0, color = "grey75", linewidth = 0.5) +
+      geom_ribbon(
+        aes(ymin = CI_low, ymax = CI_high),
+        fill = condition_color("rubi_light - rubi_no_light"),
+        alpha = 0.14,
+        color = NA
+      ) +
       geom_line(color = condition_color("rubi_light - rubi_no_light"),
                 linewidth = 1.35) +
       labs(
@@ -3257,7 +3397,7 @@ make_light_cluster_delta_with_nic_plots <- function(light_clusters,
           n_clusters,
           " підгрупи; n опроміненого = ", n_light,
           ", n неопроміненого = ", n_no_light,
-          "; Δ = опромінений - неопромінений; nicotine пунктиром, підйом на 420 с"
+          "; Δ = опромінений - неопромінений; CI через поширення SEM незалежних середніх; nicotine пунктиром"
         ),
         x = "Час від початку відповіді, с",
         y = "Δ середньої нормованої відповіді"
@@ -3351,6 +3491,13 @@ if (exists("paired_rubi_delta") && exists("paired_rubi_delta_mean")) {
     geom_hline(yintercept = 0, color = "grey70", linewidth = 0.5) +
     geom_line(color = condition_color("rubi_light - rubi_no_light"),
               linewidth = 0.9, alpha = 0.55) +
+    geom_ribbon(
+      data = paired_rubi_delta_mean,
+      aes(TimeRubi, ymin = CI_low, ymax = CI_high),
+      inherit.aes = FALSE,
+      fill = "grey35",
+      alpha = 0.18
+    ) +
     geom_line(data = paired_rubi_delta_mean, aes(TimeRubi, Mean),
               inherit.aes = FALSE, color = "black", linewidth = 1.35) +
     labs(
@@ -3390,11 +3537,23 @@ p_nic_vs_rubi_difference <- ggplot(
   light_band_layer() +
   geom_hline(yintercept = 0, color = "grey75", linewidth = 0.4) +
   geom_vline(xintercept = 420, linetype = "dashed", color = "grey45") +
+  geom_ribbon(
+    data = nic_vs_rubi_difference %>%
+      dplyr::filter(
+        Condition == "rubi_light - rubi_no_light",
+        is.finite(CI_low),
+        is.finite(CI_high)
+      ),
+    aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+    alpha = 0.14,
+    color = NA
+  ) +
   geom_line(linewidth = 1.25) +
   condition_color_scale(breaks = c("nic mean", "rubi_light - rubi_no_light")) +
+  condition_fill_scale(breaks = c("rubi_light - rubi_no_light")) +
   labs(
     title = "Середня nicotine і Δ RuBi-Nicotine",
-    subtitle = "Початок підйому nicotine вирівняно до 420 с",
+    subtitle = "Початок підйому nicotine вирівняно до 420 с; CI Δ через поширення SEM незалежних середніх",
     x = "Час від початку відповіді, с",
     y = "Нормована відповідь"
   ) +
@@ -3431,25 +3590,25 @@ print(p_nic_vs_rubi_kinetics)
 save_group_plot(p_nic_records, "nic", "nic_individual_curves_and_mean")
 save_group_plot(
   p_rubi_light_no_light_difference,
-  "rubi_comparison",
+  "rubi_comparison/1_no_subgroups",
   "rubi_light_rubi_no_light_and_difference"
 )
 save_group_plot(
   p_rubi_mean_delta_only,
-  "rubi_comparison",
+  "rubi_comparison/1_no_subgroups",
   "rubi_light_minus_no_light_mean_delta_only"
 )
 if (exists("p_paired_rubi_delta_with_nic")) {
   save_group_plot(
     p_paired_rubi_delta_with_nic,
-    "rubi_comparison",
+    "rubi_comparison/1_no_subgroups",
     "paired_rubi_light_minus_no_light_prelight_aligned_delta_with_nic"
   )
 }
 if (exists("p_paired_rubi_delta_nic_kinetics")) {
   save_group_plot(
     p_paired_rubi_delta_nic_kinetics,
-    "rubi_comparison",
+    "rubi_comparison/1_no_subgroups",
     "paired_rubi_light_minus_no_light_delta_with_nic_kinetics"
   )
 }
@@ -3457,7 +3616,7 @@ if (exists("rubi_light_cluster_delta_with_nic_plots_2")) {
   for (nm in names(rubi_light_cluster_delta_with_nic_plots_2)) {
     save_group_plot(
       rubi_light_cluster_delta_with_nic_plots_2[[nm]],
-      "rubi_comparison",
+      "rubi_comparison/2_subgroups",
       paste0("rubi_light_subgroup_minus_no_light_mean_delta_with_nic_2_groups_", nm)
     )
   }
@@ -3466,7 +3625,7 @@ if (exists("rubi_light_cluster_delta_with_nic_plots_3")) {
   for (nm in names(rubi_light_cluster_delta_with_nic_plots_3)) {
     save_group_plot(
       rubi_light_cluster_delta_with_nic_plots_3[[nm]],
-      "rubi_comparison",
+      "rubi_comparison/3_subgroups",
       paste0("rubi_light_subgroup_minus_no_light_mean_delta_with_nic_3_groups_", nm)
     )
   }
@@ -3475,7 +3634,7 @@ if (exists("rubi_light_cluster_delta_nic_kinetics_plots_2")) {
   for (nm in names(rubi_light_cluster_delta_nic_kinetics_plots_2)) {
     save_group_plot(
       rubi_light_cluster_delta_nic_kinetics_plots_2[[nm]],
-      "rubi_comparison",
+      "rubi_comparison/2_subgroups",
       paste0("rubi_light_subgroup_minus_no_light_delta_with_nic_kinetics_2_groups_", nm)
     )
   }
@@ -3484,7 +3643,7 @@ if (exists("rubi_light_cluster_delta_nic_kinetics_plots_3")) {
   for (nm in names(rubi_light_cluster_delta_nic_kinetics_plots_3)) {
     save_group_plot(
       rubi_light_cluster_delta_nic_kinetics_plots_3[[nm]],
-      "rubi_comparison",
+      "rubi_comparison/3_subgroups",
       paste0("rubi_light_subgroup_minus_no_light_delta_with_nic_kinetics_3_groups_", nm)
     )
   }
@@ -3501,12 +3660,12 @@ save_group_plot(
 )
 save_group_plot(
   p_nic_vs_rubi_difference,
-  "rubi_comparison",
+  "rubi_comparison/1_no_subgroups",
   "mean_delta_with_nicotine_rise_at_420"
 )
 save_group_plot(
   p_nic_vs_rubi_kinetics,
-  "rubi_comparison",
+  "rubi_comparison/1_no_subgroups",
   "mean_delta_with_nicotine_rise_at_420_kinetics"
 )
 ```
@@ -3558,6 +3717,13 @@ for (condition_key in condition_keys) {
   p_curves <- ggplot(res_plot_data, aes(TimeRubi, TraceNormKCl0, group = Curve)) +
     light_band_layer() +
     geom_line(alpha = 0.35, linewidth = 0.55, color = condition_color(condition_key)) +
+    geom_ribbon(
+      data = res$mean,
+      aes(TimeRubi, ymin = CI_low, ymax = CI_high),
+      inherit.aes = FALSE,
+      fill = "grey35",
+      alpha = 0.18
+    ) +
     geom_line(data = res$mean, aes(TimeRubi, Mean),
               inherit.aes = FALSE, color = "black", linewidth = 1.25) +
     labs(
@@ -3581,8 +3747,14 @@ for (condition_key in condition_keys) {
 
   p_mean_compare <- ggplot(mean_compare_plot, aes(TimeRubi, Mean, color = Condition)) +
     light_band_layer() +
+    geom_ribbon(
+      aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+      alpha = 0.16,
+      color = NA
+    ) +
     geom_line(linewidth = 1.25) +
     condition_color_scale(breaks = c(condition_key, "rubi_light")) +
+    condition_fill_scale(breaks = c(condition_key, "rubi_light")) +
     labs(
       title = paste0(
         "Середні криві\n", condition_title,
@@ -3618,8 +3790,14 @@ all_means_plot <- crop_to_shortest_curve(all_means_without_no_light)
 p_all_means_without_no_light <- ggplot(all_means_plot,
                                        aes(TimeRubi, Mean, color = Condition)) +
   light_band_layer() +
+  geom_ribbon(
+    aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+    alpha = 0.12,
+    color = NA
+  ) +
   geom_line(linewidth = 1.15) +
   condition_color_scale() +
+  condition_fill_scale() +
   labs(
     title = "Середні криві всіх досліджуваних груп",
     x = "Час від початку відповіді, с",
@@ -3697,12 +3875,16 @@ glutathione_vs_rubi_no_light <- dplyr::bind_rows(
     glutathione_mean,
     TimeFromOnset = TimeRubi - 300,
     Mean,
+    CI_low,
+    CI_high,
     Condition = "glutathione"
   ),
   dplyr::transmute(
     rubi_no_light_mean,
     TimeFromOnset = TimeRubi - 300,
     Mean,
+    CI_low,
+    CI_high,
     Condition = "rubi_no_light"
   )
 )
@@ -3711,8 +3893,14 @@ p_glutathione_vs_rubi_no_light <- ggplot(
   glutathione_vs_rubi_no_light,
   aes(TimeFromOnset, Mean, color = Condition)
 ) +
+  geom_ribbon(
+    aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+    alpha = 0.16,
+    color = NA
+  ) +
   geom_line(linewidth = 1.25) +
   condition_color_scale(breaks = c("glutathione", "rubi_no_light")) +
+  condition_fill_scale(breaks = c("glutathione", "rubi_no_light")) +
   labs(
     title = "Середні криві Glutathione і неопроміненого RuBi-Nicotine",
     x = "Час від початку відповіді, с",
@@ -3733,8 +3921,14 @@ h2o2_means <- dplyr::bind_rows(lapply(h2o2_keys, function(condition_key) {
 }))
 
 p_h2o2_conditions <- ggplot(h2o2_means, aes(TimeFromOnset, Mean, color = Condition)) +
+  geom_ribbon(
+    aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+    alpha = 0.16,
+    color = NA
+  ) +
   geom_line(linewidth = 1.25) +
   condition_color_scale() +
+  condition_fill_scale() +
   labs(
     title = "H2O2 після Glutathione і без нього",
     x = "Час від початку відповіді H2O2, с",
@@ -3763,7 +3957,9 @@ rubi_h2o2_onset_means <- lapply(names(rubi_glutathione_h2o2_means), function(key
   }
   data.frame(
     TimeFromOnset = comparison_time,
-    Mean = mean_data$Mean
+    Mean = mean_data$Mean,
+    CI_low = mean_data$CI_low,
+    CI_high = mean_data$CI_high
   )
 })
 names(rubi_h2o2_onset_means) <- names(rubi_glutathione_h2o2_means)
@@ -3783,8 +3979,14 @@ p_rubi_no_light_vs_h2o2 <- ggplot(
 ) +
   geom_hline(yintercept = 0, color = "grey75", linewidth = 0.4) +
   geom_vline(xintercept = 0, linetype = "dashed", color = "grey45") +
+  geom_ribbon(
+    aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+    alpha = 0.14,
+    color = NA
+  ) +
   geom_line(linewidth = 1.25) +
   condition_color_scale() +
+  condition_fill_scale() +
   labs(
     title = "RuBi-Nicotine, Glutathione та відповіді H2O2",
     x = "Час від початку відповіді, с",
