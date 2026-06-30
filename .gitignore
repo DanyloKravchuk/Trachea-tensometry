@@ -1,0 +1,11 @@
+.Rhistory
+.Rproj.user/
+Rplots.pdf
+*.html
+*.tmp
+
+.agents/
+.codex/
+
+data/
+figs/
