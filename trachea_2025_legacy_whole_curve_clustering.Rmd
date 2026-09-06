@@ -1,0 +1,409 @@
+# Архів: кластеризація RuBi-Nicotine за всією кривою
+
+Ці вимкнені chunk замінені кластеризацією у вікні 420-540 с.
+Код залежить від об'єктів основного Rmd і збережений лише для історії.
+
+```{r rubi_light_cluster_check, eval=FALSE, fig.width=10, fig.height=6}
+# Тимчасово вимкнено: це групування по всій кривій, а не лише по зоні опромінення 420-540 с.
+summarise_rubi_light_curve <- function(d) {
+  d <- d[order(d$TimeRubi), ]
+  time <- d$TimeRubi
+  value <- d$TraceNormKCl0
+  max_value <- max(value, na.rm = TRUE)
+  peak_idx <- which.max(value)
+  half_max <- 0.5 * max_value
+  t50_idx <- which(value >= half_max)[1]
+
+  data.frame(
+    Curve = d$Curve[1],
+    Sample = d$Sample[1],
+    SeriesList = d$SeriesList[1],
+    Max = max_value,
+    T_peak = time[peak_idx],
+    T50 = time[t50_idx],
+    Y600 = curve_value_at(time, value, 600),
+    Y1200 = curve_value_at(time, value, 1200),
+    Y1500 = curve_value_at(time, value, 1500),
+    DropFromPeak = max_value - curve_value_at(time, value, min(max(time), 1500)),
+    AmplitudeKCl = d$AmplitudeKCl[1]
+  )
+}
+
+make_rubi_light_clusters <- function(rubi_data, n_clusters) {
+  features <- dplyr::bind_rows(lapply(
+    split(rubi_data, rubi_data$Curve),
+    summarise_rubi_light_curve
+  ))
+
+  feature_cols <- c(
+    "Max", "T_peak", "T50", "Y600", "Y1200", "Y1500", "DropFromPeak"
+  )
+  feature_mat <- as.matrix(features[, feature_cols])
+  for (j in seq_len(ncol(feature_mat))) {
+    feature_mat[!is.finite(feature_mat[, j]), j] <- median(
+      feature_mat[, j], na.rm = TRUE
+    )
+  }
+
+  set.seed(1)
+  scaled_feature_mat <- scale(feature_mat)
+  scaled_feature_mat[!is.finite(scaled_feature_mat)] <- 0
+  km <- stats::kmeans(scaled_feature_mat, centers = n_clusters, nstart = 100)
+  features$ClusterRaw <- km$cluster
+
+  cluster_stats <- features %>%
+    dplyr::group_by(ClusterRaw) %>%
+    dplyr::summarise(
+      Max = mean(Max, na.rm = TRUE),
+      T_peak = mean(T_peak, na.rm = TRUE),
+      DropFromPeak = mean(DropFromPeak, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  if (n_clusters == 2) {
+    cluster_stats <- cluster_stats %>%
+      dplyr::arrange(dplyr::desc(Max)) %>%
+      dplyr::mutate(ClusterLabel = c("Вища відповідь", "Нижча відповідь"))
+  } else {
+    early_raw <- cluster_stats$ClusterRaw[which.max(cluster_stats$DropFromPeak)]
+    high_raw <- cluster_stats$ClusterRaw[
+      which.max(ifelse(cluster_stats$ClusterRaw == early_raw, -Inf, cluster_stats$Max))
+    ]
+    cluster_stats$ClusterLabel <- "Помірна тривала відповідь"
+    cluster_stats$ClusterLabel[cluster_stats$ClusterRaw == high_raw] <- "Висока тривала відповідь"
+    cluster_stats$ClusterLabel[cluster_stats$ClusterRaw == early_raw] <- "Рання/транзиторна відповідь"
+  }
+
+  features <- features %>%
+    dplyr::left_join(cluster_stats[, c("ClusterRaw", "ClusterLabel")],
+                     by = "ClusterRaw")
+
+  rubi_clustered <- rubi_data %>%
+    dplyr::left_join(features[, c("Curve", "ClusterLabel")], by = "Curve")
+
+  cluster_means <- dplyr::bind_rows(lapply(
+    split(rubi_clustered, rubi_clustered$ClusterLabel),
+    function(d) {
+      m <- make_mean_curve(
+        split(d, d$Curve),
+        time_col = "TimeRubi",
+        value_col = "TraceNormKCl0"
+      )
+      m$ClusterLabel <- d$ClusterLabel[1]
+      m$N_curves <- dplyr::n_distinct(d$Curve)
+      m
+    }
+  ))
+
+  list(features = features, data = rubi_clustered, mean = cluster_means)
+}
+
+rubi_light_clusters_2 <- make_rubi_light_clusters(rubi_light_norm, 2)
+rubi_light_clusters_3 <- make_rubi_light_clusters(rubi_light_norm, 3)
+
+print(rubi_light_clusters_2$features %>%
+  dplyr::count(ClusterLabel, name = "N"))
+print(rubi_light_clusters_3$features %>%
+  dplyr::arrange(ClusterLabel, dplyr::desc(Max)) %>%
+  dplyr::select(ClusterLabel, Sample, SeriesList, Max, T_peak, T50, Y600, Y1200,
+                DropFromPeak, AmplitudeKCl))
+
+cluster_colors_2 <- c(
+  "Вища відповідь" = "#E31A1C",
+  "Нижча відповідь" = "#0077B6"
+)
+cluster_colors_3 <- c(
+  "Висока тривала відповідь" = "#E31A1C",
+  "Помірна тривала відповідь" = "#0077B6",
+  "Рання/транзиторна відповідь" = "#FFB000"
+)
+
+rubi_light_cluster_plot_data <- thin_plot_data(
+  rubi_light_clusters_3$data,
+  group_col = "Curve",
+  max_points = 4000
+)
+
+p_rubi_light_clusters_individual <- ggplot(
+  rubi_light_cluster_plot_data,
+  aes(TimeRubi, TraceNormKCl0, group = Curve, color = ClusterLabel)
+) +
+  light_band_layer() +
+  geom_line(alpha = 0.45, linewidth = 0.6) +
+  geom_ribbon(
+    data = rubi_light_clusters_3$mean,
+    aes(TimeRubi, ymin = CI_low, ymax = CI_high, fill = ClusterLabel),
+    inherit.aes = FALSE,
+    alpha = 0.16,
+    color = NA
+  ) +
+  geom_line(
+    data = rubi_light_clusters_3$mean,
+    aes(TimeRubi, Mean, color = ClusterLabel),
+    inherit.aes = FALSE,
+    linewidth = 1.4
+  ) +
+  scale_color_manual(values = cluster_colors_3, name = NULL) +
+  scale_fill_manual(values = cluster_colors_3, guide = "none") +
+  labs(
+    title = "Опромінений RuBi-Nicotine: перевірка 3 підгруп",
+    subtitle = "Тонкі лінії - окремі криві; товсті лінії - середні по підгрупах",
+    x = "Час від початку відповіді, с",
+    y = "Нормована відповідь"
+  ) +
+  presentation_theme() +
+  axes_from_origin(rubi_light_clusters_3$data, "TimeRubi")
+
+p_rubi_light_cluster_means_2 <- ggplot(
+  rubi_light_clusters_2$mean,
+  aes(TimeRubi, Mean, color = ClusterLabel)
+) +
+  light_band_layer() +
+  geom_ribbon(
+    aes(ymin = CI_low, ymax = CI_high, fill = ClusterLabel),
+    alpha = 0.18,
+    color = NA
+  ) +
+  geom_line(linewidth = 1.4) +
+  scale_color_manual(values = cluster_colors_2, name = NULL) +
+  scale_fill_manual(values = cluster_colors_2, guide = "none") +
+  labs(
+    title = "Опромінений RuBi-Nicotine: середні криві 2 підгруп",
+    x = "Час від початку відповіді, с",
+    y = "Середня нормована відповідь"
+  ) +
+  presentation_theme() +
+  axes_from_origin(rubi_light_clusters_2$mean, "TimeRubi")
+
+p_rubi_light_cluster_means_3 <- ggplot(
+  rubi_light_clusters_3$mean,
+  aes(TimeRubi, Mean, color = ClusterLabel)
+) +
+  light_band_layer() +
+  geom_ribbon(
+    aes(ymin = CI_low, ymax = CI_high, fill = ClusterLabel),
+    alpha = 0.18,
+    color = NA
+  ) +
+  geom_line(linewidth = 1.4) +
+  scale_color_manual(values = cluster_colors_3, name = NULL) +
+  scale_fill_manual(values = cluster_colors_3, guide = "none") +
+  labs(
+    title = "Опромінений RuBi-Nicotine: середні криві 3 підгруп",
+    x = "Час від початку відповіді, с",
+    y = "Середня нормована відповідь"
+  ) +
+  presentation_theme() +
+  axes_from_origin(rubi_light_clusters_3$mean, "TimeRubi")
+
+show_plot(p_rubi_light_clusters_individual)
+show_plot(p_rubi_light_cluster_means_2)
+show_plot(p_rubi_light_cluster_means_3)
+
+save_group_plot(
+  p_rubi_light_clusters_individual,
+  "rubi_light",
+  "cluster_check_individual_curves_3_groups"
+)
+save_group_plot(
+  p_rubi_light_cluster_means_2,
+  "rubi_light",
+  "cluster_check_mean_curves_2_groups"
+)
+save_group_plot(
+  p_rubi_light_cluster_means_3,
+  "rubi_light",
+  "cluster_check_mean_curves_3_groups"
+)
+```
+
+```{r rubi_light_subgroups_vs_no_light_mean, eval=FALSE, fig.width=10, fig.height=6}
+# Тимчасово вимкнено: ці графіки спираються на групування по всій кривій.
+cluster_label_slug <- function(x) {
+  dplyr::case_when(
+    x == "Вища відповідь" ~ "higher_response",
+    x == "Нижча відповідь" ~ "lower_response",
+    x == "Висока тривала відповідь" ~ "high_sustained_response",
+    x == "Помірна тривала відповідь" ~ "moderate_sustained_response",
+    x == "Рання/транзиторна відповідь" ~ "early_transient_response",
+    TRUE ~ gsub("[^A-Za-z0-9]+", "_", x)
+  )
+}
+
+make_light_cluster_vs_no_light_mean_plots <- function(light_clusters,
+                                                      n_clusters,
+                                                      cluster_colors) {
+  cluster_order <- names(cluster_colors)
+  cluster_order <- cluster_order[cluster_order %in% unique(light_clusters$mean$ClusterLabel)]
+
+  plots <- lapply(cluster_order, function(cluster_label) {
+    light_d <- light_clusters$mean %>%
+      dplyr::filter(ClusterLabel == cluster_label) %>%
+      dplyr::mutate(Condition = "rubi_light")
+    no_light_d <- rubi_no_light_mean %>%
+      dplyr::mutate(ClusterLabel = cluster_label, Condition = "rubi_no_light")
+    d <- dplyr::bind_rows(light_d, no_light_d)
+    n_light <- light_clusters$features %>%
+      dplyr::filter(ClusterLabel == cluster_label) %>%
+      dplyr::pull(Curve) %>%
+      dplyr::n_distinct()
+    n_no_light <- dplyr::n_distinct(rubi_no_light_norm$Curve)
+
+    ggplot(d, aes(TimeRubi, Mean, color = Condition)) +
+      light_band_layer() +
+      geom_ribbon(
+        aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+        alpha = 0.16,
+        color = NA
+      ) +
+      geom_line(linewidth = 1.45) +
+      condition_color_scale(breaks = c("rubi_light", "rubi_no_light")) +
+      condition_fill_scale(breaks = c("rubi_light", "rubi_no_light")) +
+      labs(
+        title = paste0("Підгрупа опроміненого RuBi-Nicotine: ", cluster_label),
+        subtitle = paste0(
+          n_clusters,
+          " підгрупи; n опроміненого = ", n_light,
+          ", n неопроміненого = ", n_no_light,
+          "; Δ = опромінений - неопромінений"
+        ),
+        x = "Час від початку відповіді, с",
+        y = "Середня нормована відповідь"
+      ) +
+      presentation_theme() +
+      axes_from_origin(d, "TimeRubi")
+  })
+  names(plots) <- cluster_label_slug(cluster_order)
+  plots
+}
+
+make_light_cluster_delta_vs_no_light_mean_plots <- function(light_clusters,
+                                                            n_clusters,
+                                                            cluster_colors) {
+  cluster_order <- names(cluster_colors)
+  cluster_order <- cluster_order[cluster_order %in% unique(light_clusters$mean$ClusterLabel)]
+
+  plots <- lapply(cluster_order, function(cluster_label) {
+    light_d <- light_clusters$mean %>%
+      dplyr::filter(ClusterLabel == cluster_label)
+    no_light_d <- rubi_no_light_mean
+
+    start_time <- max(min(light_d$TimeRubi), min(no_light_d$TimeRubi))
+    end_time <- min(max(light_d$TimeRubi), max(no_light_d$TimeRubi))
+    dt <- median(c(diff(light_d$TimeRubi), diff(no_light_d$TimeRubi)), na.rm = TRUE)
+    if (!is.finite(dt) || dt <= 0 || end_time <= start_time) return(NULL)
+
+    grid <- seq(start_time, end_time, by = dt)
+    delta_d <- make_independent_mean_delta(light_d, no_light_d, grid)
+    delta_d$Delta <- delta_d$Mean
+    delta_d$ClusterLabel <- cluster_label
+
+    n_light <- light_clusters$features %>%
+      dplyr::filter(ClusterLabel == cluster_label) %>%
+      dplyr::pull(Curve) %>%
+      dplyr::n_distinct()
+    n_no_light <- dplyr::n_distinct(rubi_no_light_norm$Curve)
+
+    ggplot(delta_d, aes(TimeRubi, Delta)) +
+      light_band_layer() +
+      geom_hline(yintercept = 0, color = "grey75", linewidth = 0.5) +
+      geom_ribbon(
+        aes(ymin = CI_low, ymax = CI_high),
+        fill = condition_color("rubi_light - rubi_no_light"),
+        alpha = 0.14,
+        color = NA
+      ) +
+      geom_line(color = condition_color("rubi_light - rubi_no_light"),
+                linewidth = 1.35) +
+      labs(
+        title = paste0("Δ підгрупи опроміненого RuBi-Nicotine: ", cluster_label),
+        subtitle = paste0(
+          n_clusters,
+          " підгрупи; n опроміненого = ", n_light,
+          ", n неопроміненого = ", n_no_light,
+          "; Δ = опромінений - неопромінений; CI через поширення SEM незалежних середніх"
+        ),
+        x = "Час від початку відповіді, с",
+        y = "Δ середньої нормованої відповіді"
+      ) +
+      presentation_theme() +
+      axes_from_origin(delta_d, "TimeRubi")
+  })
+  names(plots) <- cluster_label_slug(cluster_order)
+  plots[!vapply(plots, is.null, logical(1))]
+}
+
+rubi_light_cluster_vs_no_light_mean_plots_2 <- make_light_cluster_vs_no_light_mean_plots(
+  rubi_light_clusters_2,
+  n_clusters = 2,
+  cluster_colors = cluster_colors_2
+)
+rubi_light_cluster_vs_no_light_mean_plots_3 <- make_light_cluster_vs_no_light_mean_plots(
+  rubi_light_clusters_3,
+  n_clusters = 3,
+  cluster_colors = cluster_colors_3
+)
+rubi_light_cluster_delta_vs_no_light_mean_plots_2 <- make_light_cluster_delta_vs_no_light_mean_plots(
+  rubi_light_clusters_2,
+  n_clusters = 2,
+  cluster_colors = cluster_colors_2
+)
+rubi_light_cluster_delta_vs_no_light_mean_plots_3 <- make_light_cluster_delta_vs_no_light_mean_plots(
+  rubi_light_clusters_3,
+  n_clusters = 3,
+  cluster_colors = cluster_colors_3
+)
+
+for (p in rubi_light_cluster_vs_no_light_mean_plots_2) show_plot(p)
+for (p in rubi_light_cluster_vs_no_light_mean_plots_3) show_plot(p)
+for (p in rubi_light_cluster_delta_vs_no_light_mean_plots_2) show_plot(p)
+for (p in rubi_light_cluster_delta_vs_no_light_mean_plots_3) show_plot(p)
+
+for (nm in names(rubi_light_cluster_vs_no_light_mean_plots_2)) {
+  save_group_plot(
+    rubi_light_cluster_vs_no_light_mean_plots_2[[nm]],
+    "rubi_comparison/2_subgroups",
+    paste0("rubi_light_subgroup_vs_no_light_mean_2_groups_", nm)
+  )
+}
+for (nm in names(rubi_light_cluster_vs_no_light_mean_plots_3)) {
+  save_group_plot(
+    rubi_light_cluster_vs_no_light_mean_plots_3[[nm]],
+    "rubi_comparison/3_subgroups",
+    paste0("rubi_light_subgroup_vs_no_light_mean_3_groups_", nm)
+  )
+}
+for (nm in names(rubi_light_cluster_delta_vs_no_light_mean_plots_2)) {
+  save_group_plot(
+    rubi_light_cluster_delta_vs_no_light_mean_plots_2[[nm]],
+    "rubi_comparison/2_subgroups",
+    paste0("rubi_light_subgroup_minus_no_light_mean_delta_2_groups_", nm)
+  )
+}
+for (nm in names(rubi_light_cluster_delta_vs_no_light_mean_plots_3)) {
+  save_group_plot(
+    rubi_light_cluster_delta_vs_no_light_mean_plots_3[[nm]],
+    "rubi_comparison/3_subgroups",
+    paste0("rubi_light_subgroup_minus_no_light_mean_delta_3_groups_", nm)
+  )
+}
+```
+
+```{r clear_whole_curve_rubi_clusters, include=FALSE}
+# Щоб у інтерактивній сесії не підтягувались старі групи, пораховані по всій кривій.
+whole_curve_rubi_clusters_enabled <- FALSE
+old_whole_curve_cluster_objects <- c(
+  "rubi_light_clusters_2",
+  "rubi_light_clusters_3",
+  "rubi_light_cluster_vs_no_light_mean_plots_2",
+  "rubi_light_cluster_vs_no_light_mean_plots_3",
+  "rubi_light_cluster_delta_vs_no_light_mean_plots_2",
+  "rubi_light_cluster_delta_vs_no_light_mean_plots_3",
+  "rubi_light_cluster_delta_with_nic_plots_2",
+  "rubi_light_cluster_delta_with_nic_plots_3",
+  "rubi_light_cluster_delta_nic_kinetics_plots_2",
+  "rubi_light_cluster_delta_nic_kinetics_plots_3"
+)
+rm(list = intersect(old_whole_curve_cluster_objects, ls(envir = .GlobalEnv)),
+   envir = .GlobalEnv)
+```

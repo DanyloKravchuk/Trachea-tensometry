@@ -1,21 +1,46 @@
-﻿<!-- This child Rmd is included from trachea 2025 optimized.Rmd. -->
-<!-- It contains package loading, raw data import, and file combining. -->
+# Аналіз тензометрії трахеї
 
-```{r library}
+Цей документ виконує повний відтворюваний аналіз: імпортує сирі записи,
+об'єднує послідовні файли, коригує базову лінію, видаляє технічні мітки,
+нормує відповіді на KCl, синхронізує криві та формує графіки й CSV.
+
+Порядок виконання:
+
+1. службові функції та параметри візуалізації;
+2. імпорт і об'єднання сирих файлів;
+3. часові вікна KCl та біологічних відповідей;
+4. корекція базової лінії й технічних артефактів;
+5. основний аналіз RuBi-Nicotine та фармакологічних груп;
+6. експериментальні порівняння, експорт графіків і таблиць.
+
+> Часові вікна та списки виключень є частиною конфігурації експерименту.
+> Їх не слід змінювати без перевірки відповідного сирого запису.
+
+Основні типи об'єктів у документі:
+
+- `data_MM_DD_NNNN` - один сирий CSV;
+- `data_MM_DD_N` - один експериментальний запис, зшитий із кількох CSV;
+- `series_list_*` - часові вікна KCl та досліджуваних відповідей;
+- `*_norm` - очищені й нормовані окремі криві;
+- `*_mean` - середня, SD, SEM, 95% CI та кількість кривих у кожній точці;
+- `p_*` - готові об'єкти графіків.
+
+## 1. Пакети та службові функції
+
+```{r setup_packages}
 library(tidyverse)
 library(conflicted)
 conflicts_prefer(dplyr::filter())
 library(patchwork)
-library(pracma)
-library(mclust)
-library(signal)
-library(zoo)      # для згладжування (rollmean)
-library(TTR)
-library(gridExtra)
-library(scales)
+
+# Глобальні параметри, спільні для всіх етапів аналізу.
+default_marker_range <- c(4.6, 5.6)  # типовий діапазон короткої 5 V-мітки
+marker_range <- default_marker_range
+light_window <- c(420, 540)  # опромінення: 420-540 с від початку вікна
 ```
 
 ```{r helper_functions}
+# Безпечно повертає максимальний час датафрейму або 0, якщо об'єкт відсутній.
 max_time_safe <- function(obj, time_col = "Time", envir = .GlobalEnv) {
   if (is.character(obj)) {
     if (!exists(obj, envir = envir)) return(0)
@@ -28,33 +53,9 @@ max_time_safe <- function(obj, time_col = "Time", envir = .GlobalEnv) {
   if (!is.finite(val)) 0 else val
 }
 
-collect_series_lists_from_rmd <- function(rmd_path) {
-  rmd_lines <- readLines(rmd_path, warn = FALSE, encoding = "UTF-8")
-  starts <- grep("^\\s*series_list[^[:space:]]*\\s*<-\\s*list\\s*\\(", rmd_lines)
-  out <- list()
-
-  for (st in starts) {
-    buf <- character()
-    for (j in st:length(rmd_lines)) {
-      if (grepl("^```", rmd_lines[j]) && length(buf) > 0) break
-      buf <- c(buf, rmd_lines[j])
-      expr <- try(parse(text = buf), silent = TRUE)
-      if (inherits(expr, "try-error")) next
-
-      call <- expr[[1]]
-      list_name <- as.character(call[[2]])
-      list_value <- try(eval(call[[3]], envir = .GlobalEnv), silent = TRUE)
-      if (!inherits(list_value, "try-error") && is.list(list_value)) {
-        out[[length(out) + 1]] <- list(name = list_name, value = list_value)
-      }
-      break
-    }
-  }
-
-  out
-}
-
-remove_short_voltage_markers <- function(d, marker_range = c(4.6, 5.6),
+# Виявляє короткі електричні мітки за різкими краями та локальним відхиленням.
+# Функція лише позначає точки у RemovedMarker; відновлення виконується окремо.
+remove_short_voltage_markers <- function(d, marker_range = default_marker_range,
                                          spike_min_height = 0.15,
                                          mad_mult = 8,
                                          smooth_window_sec = 5,
@@ -176,6 +177,8 @@ remove_short_voltage_markers <- function(d, marker_range = c(4.6, 5.6),
   d
 }
 
+# Замінює позначену коротку ділянку гладким трендом між неушкодженими флангами
+# і повертає локальну зашумленість, щоб вставка не виглядала штучною прямою.
 repair_flagged_trace <- function(d, flagged, time_col = "Time", value_col = "Trace",
                                  flank_sec = 30,
                                  trend_method = c("loess", "linear")) {
@@ -260,6 +263,7 @@ repair_flagged_trace <- function(d, flagged, time_col = "Time", value_col = "Tra
   d
 }
 
+# Залишає для виправлення лише короткі послідовності підозрілих точок.
 keep_short_artifact_runs <- function(flagged, time, max_duration_sec = 45) {
   flagged[is.na(flagged)] <- FALSE
   out <- rep(FALSE, length(flagged))
@@ -276,6 +280,7 @@ keep_short_artifact_runs <- function(flagged, time, max_duration_sec = 45) {
   out
 }
 
+# Автоматично прибирає імпульсні артефакти до очікуваного початку відповіді.
 repair_pre_onset_artifacts <- function(d, onset_time,
                                        time_col = "TimeRubi",
                                        value_col = "TraceNormKCl0",
@@ -332,6 +337,8 @@ repair_pre_onset_artifacts <- function(d, onset_time,
   )
 }
 
+# Друга перевірка вже після нормування: шукає короткі різкі піки/провали,
+# які могли не потрапити у вольтажний критерій сирої кривої.
 repair_short_normalized_pulses <- function(d,
                                            time_col = "TimeRubi",
                                            value_col = "TraceNormKCl0",
@@ -388,6 +395,7 @@ manual_artifact_windows <- list(
   "rubi_light:data_09_15_1" = matrix(c(437, 463), ncol = 2, byrow = TRUE)
 )
 
+# Точкові ручні винятки для артефактів, підтверджених за сирими записами.
 repair_manual_artifacts <- function(d, condition_key, sample_name,
                                     time_col = "TimeRubi",
                                     value_col = "TraceNormKCl0") {
@@ -408,6 +416,7 @@ repair_manual_artifacts <- function(d, condition_key, sample_name,
   )
 }
 
+# Забирає повільний лінійний дрейф перед відповіддю, не змінюючи її форму після старту.
 correct_pre_response_linear <- function(d, onset_time,
                                         time_col = "TimeRubi",
                                         value_col = "TraceNormKCl0",
@@ -441,8 +450,15 @@ correct_pre_response_linear <- function(d, onset_time,
   d$PreResponseLinearBaseline <- baseline
   d
 }
+```
 
-extract_clean_window <- function(sample_name, window, marker_range = c(4.6, 5.6)) {
+### Вікна, статистика й усереднення
+
+```{r helper_curve_statistics}
+# Вирізає часовий інтервал, обирає скоригований Trace за наявності,
+# видаляє вольтажні мітки й повертає лише скінченні Time/Trace.
+extract_clean_window <- function(sample_name, window,
+                                 marker_range = default_marker_range) {
   if (!exists(sample_name, envir = .GlobalEnv)) return(NULL)
   df <- get(sample_name, envir = .GlobalEnv)
   if (!is.data.frame(df) || !("Time" %in% names(df))) return(NULL)
@@ -471,6 +487,27 @@ extract_clean_window <- function(sample_name, window, marker_range = c(4.6, 5.6)
   d
 }
 
+# Лінійна інтерполяція значення кривої у заданий момент часу.
+curve_value_at <- function(time, value, target_time, rule = 2) {
+  stats::approx(time, value, xout = target_time, rule = rule, ties = mean)$y
+}
+
+# Площа під кривою методом трапецій; нечислові точки перед розрахунком вилучаються.
+trapezoid_auc <- function(time, value) {
+  keep <- is.finite(time) & is.finite(value)
+  time <- time[keep]
+  value <- value[keep]
+  if (length(time) < 2) return(NA_real_)
+
+  ord <- order(time)
+  time <- time[ord]
+  value <- value[ord]
+  sum(diff(time) * (value[-1] + value[-length(value)]) / 2)
+}
+
+# Інтерполює всі криві на спільну часову сітку. За замовчуванням сітка
+# завершується разом із найкоротшою кривою, тому N є сталим уздовж середньої.
+# 95% CI = mean +/- t(0.975, n - 1) * SEM; при n < 2 CI не визначається.
 make_mean_curve <- function(curves, time_col, value_col, max_points = 5000,
                             target_end_time = NULL,
                             end_mode = c("common", "longest")) {
@@ -514,6 +551,8 @@ make_mean_curve <- function(curves, time_col, value_col, max_points = 5000,
   )
 }
 
+# Різниця двох незалежних середніх та її CI за Welch-подібним наближенням.
+# Це не попарна статистика: попарна Δ формується окремо нижче.
 make_independent_mean_delta <- function(light_d, no_light_d, grid) {
   interp <- function(d, col) {
     approx(d$TimeRubi, d[[col]], xout = grid, rule = 1, ties = mean)$y
@@ -547,7 +586,12 @@ make_independent_mean_delta <- function(light_d, no_light_d, grid) {
     Condition = "rubi_light - rubi_no_light"
   )
 }
+```
 
+### Синхронізація кривих
+
+```{r helper_curve_alignment}
+# Оцінює час найкрутішого підйому в околі очікуваної відповіді.
 estimate_derivative_event <- function(d, time_col, value_col, expected_onset,
                                       search_radius = 90, smooth_seconds = 10) {
   d <- d[is.finite(d[[time_col]]) & is.finite(d[[value_col]]), c(time_col, value_col)]
@@ -576,6 +620,7 @@ estimate_derivative_event <- function(d, time_col, value_col, expected_onset,
   derivative_time[which.max(abs(derivative))]
 }
 
+# Альтернативна оцінка старту: перше стійке перевищення частки амплітуди.
 estimate_rise_onset <- function(d, time_col, value_col, expected_onset,
                                 baseline_window = c(-80, -20),
                                 search_window = c(-60, 180),
@@ -657,6 +702,8 @@ normalize_kinetics_from_start <- function(data, group_col = "Condition",
   dplyr::bind_rows(parts)
 }
 
+# Зсуває час кожної кривої до медіанного часу максимуму похідної.
+# Зсуви понад max_shift не застосовуються та позначаються Rejected.
 align_curves_by_derivative <- function(data, expected_onset,
                                        time_col = "TimeRubi",
                                        value_col = "TraceNormKCl0",
@@ -694,13 +741,78 @@ align_curves_by_derivative <- function(data, expected_onset,
   list(data = data, summary = summary)
 }
 
+# Вирівнювання за початком стійкого підйому. На відміну від максимуму
+# похідної, цей метод прив'язується до першого перевищення частки амплітуди.
+align_curves_by_rise_onset <- function(data, expected_onset,
+                                       time_col = "TimeRubi",
+                                       value_col = "TraceNormKCl0",
+                                       curve_col = "Curve",
+                                       max_shift = 80,
+                                       baseline_window = c(-80, -20),
+                                       search_window = c(-40, 180),
+                                       smooth_seconds = 8,
+                                       amplitude_fraction = 0.075,
+                                       sustain_seconds = 6,
+                                       target_time = NULL) {
+  curves <- split(data, data[[curve_col]])
+  event_times <- vapply(
+    curves,
+    estimate_rise_onset,
+    numeric(1),
+    time_col = time_col,
+    value_col = value_col,
+    expected_onset = expected_onset,
+    baseline_window = baseline_window,
+    search_window = search_window,
+    smooth_seconds = smooth_seconds,
+    amplitude_fraction = amplitude_fraction,
+    sustain_seconds = sustain_seconds
+  )
+
+  valid <- is.finite(event_times)
+  if (is.null(target_time)) {
+    target_time <- if (any(valid)) median(event_times[valid]) else expected_onset
+  }
+
+  raw_shift <- target_time - event_times
+  rejected <- valid & abs(raw_shift) > max_shift
+  applied_shift <- raw_shift
+  applied_shift[rejected | !valid] <- 0
+  names(applied_shift) <- names(event_times)
+
+  data$TimeBeforeAlignment <- data[[time_col]]
+  data$AlignmentShift <- applied_shift[
+    match(data[[curve_col]], names(applied_shift))
+  ]
+  data[[time_col]] <- data$TimeBeforeAlignment + data$AlignmentShift
+
+  summary <- data.frame(
+    Curve = names(event_times),
+    RiseOnsetTime = as.numeric(event_times),
+    TargetTime = target_time,
+    RawShift = as.numeric(raw_shift),
+    AppliedShift = as.numeric(applied_shift),
+    Rejected = rejected,
+    Method = paste0(round(100 * amplitude_fraction, 1), "% amplitude onset")
+  )
+
+  list(data = data, summary = summary)
+}
+```
+
+### Візуалізація й універсальна обробка умов
+
+```{r helper_plotting_and_normalization}
+# Очікуваний старт відповіді відносно початку вирізаного вікна:
+# 90 с для nicotine/H2O2 і 300 с для решти умов.
 expected_response_onset <- function(condition_key) {
   if (grepl("h2o2", condition_key, ignore.case = TRUE)) return(90)
   if (grepl("^nic", condition_key, ignore.case = TRUE)) return(90)
   300
 }
 
-light_band_layer <- function(xmin = 420, xmax = 540, fill = "#ffe66d", alpha = 0.35) {
+light_band_layer <- function(xmin = light_window[1], xmax = light_window[2],
+                             fill = "#ffe66d", alpha = 0.35) {
   ggplot2::annotate("rect", xmin = xmin, xmax = xmax,
                     ymin = -Inf, ymax = Inf, fill = fill, alpha = alpha)
 }
@@ -745,6 +857,8 @@ condition_colors <- c(
   glutathione_h2o2_1000 = "#4361EE"
 )
 
+# Єдині словник підписів і палітра зберігають кольорову відповідність умов
+# на всіх рисунках незалежно від їхнього складу.
 condition_label <- function(x) {
   out <- condition_labels[as.character(x)]
   out[is.na(out)] <- as.character(x)[is.na(out)]
@@ -826,6 +940,16 @@ save_group_plot <- function(plot, group, filename,
   )
 }
 
+# Повний прогін створює багато графіків. За замовчуванням вони зберігаються
+# на диск без масового inline-рендерингу, який перевантажує Positron.
+render_plots_inline <- FALSE
+render_key_plots_at_end <- FALSE
+
+show_plot <- function(plot, inline = render_plots_inline) {
+  if (isTRUE(inline)) print(plot)
+  invisible(plot)
+}
+
 axes_from_origin <- function(data, time_col, x_max = NULL) {
   x <- data[[time_col]]
   x <- x[is.finite(x)]
@@ -882,8 +1006,11 @@ crop_to_shortest_curve <- function(data, time_col = "TimeRubi",
   data[data[[time_col]] <= common_end, , drop = FALSE]
 }
 
+# Універсальний конвеєр для фармакологічних умов:
+# condition + KCl -> очищення -> нормування на KCl -> виправлення артефактів ->
+# синхронізація -> середня крива, SD, SEM і 95% CI.
 normalize_condition_by_kcl <- function(series_defs, condition_key,
-                                       marker_range = c(4.6, 5.6),
+                                       marker_range = default_marker_range,
                                        exclude = character(),
                                        align = TRUE) {
   parts <- list()
@@ -983,311 +1110,151 @@ normalize_condition_by_kcl <- function(series_defs, condition_key,
 }
 ```
 
-```{r, data import}
-# RuBi - light in tail
-data_09_03_0001 <- read.csv2("./data/09.2025/2025-09-03_0001.csv", sep = ";",
-         dec = ".")
-data_09_03_0002 <- read.csv2("./data/09.2025/2025-09-03_0002.csv", sep = ";",
-         dec = ".")
-data_09_03_0003 <- read.csv2("./data/09.2025/2025-09-03_0003.csv", sep = ";",
-         dec = ".")
-data_09_03_0004 <- read.csv2("./data/09.2025/2025-09-03_0004.csv", sep = ";",
-         dec = ".")
-data_09_09_0000 <- read.csv2("./data/09.2025/2025-09-09_0000.csv", sep = ";",
-         dec = ".")
-data_09_09_0001 <- read.csv2("./data/09.2025/2025-09-09_0001.csv", sep = ";",
-         dec = ".")
-data_09_09_0002 <- read.csv2("./data/09.2025/2025-09-09_0002.csv", sep = ";",
-         dec = ".")
-data_09_09_0003 <- read.csv2("./data/09.2025/2025-09-09_0003.csv", sep = ";",
-         dec = ".")
+## 2. Імпорт і об'єднання сирих файлів
 
-# RuBi - light
-data_09_10_0000 <- read.csv2("./data/09.2025/2025-09-10_0000.csv", sep = ";",
-         dec = ".")
-data_09_10_0001 <- read.csv2("./data/09.2025/2025-09-10_0001.csv", sep = ";",
-         dec = ".")
-data_09_10_0002 <- read.csv2("./data/09.2025/2025-09-10_0002.csv", sep = ";",
-         dec = ".")
-data_09_10_0003 <- read.csv2("./data/09.2025/2025-09-10_0003.csv", sep = ";",
-         dec = ".")
-data_09_10_0004 <- read.csv2("./data/09.2025/2025-09-10_0004.csv", sep = ";",
-         dec = ".")
-data_09_10_0005 <- read.csv2("./data/09.2025/2025-09-10_0005.csv", sep = ";",
-         dec = ".")
+```{r raw_data_import}
+# Усі сирі CSV лежать в одному каталозі. Нижче перелічені лише файли,
+# які потрібні цьому аналізу; назва R-об'єкта автоматично утворюється
+# з назви файла: 2025-09-03_0001.csv -> data_09_03_0001.
+raw_data_dir <- file.path("data", "09.2025")
 
-# RuBi - no light/light
-data_10_14_0002 <- read.csv2("./data/09.2025/2025-10-14_0002.csv", sep = ";",
-         dec = ".")
-data_10_14_0003 <- read.csv2("./data/09.2025/2025-10-14_0003.csv", sep = ";",
-         dec = ".")
-data_10_14_0004 <- read.csv2("./data/09.2025/2025-10-14_0004.csv", sep = ";",
-         dec = ".")
-data_10_14_0005 <- read.csv2("./data/09.2025/2025-10-14_0005.csv", sep = ";",
-         dec = ".")
-data_10_14_0006 <- read.csv2("./data/09.2025/2025-10-14_0006.csv", sep = ";",
-         dec = ".")
-data_10_14_0007 <- read.csv2("./data/09.2025/2025-10-14_0007.csv", sep = ";",
-         dec = ".")
+file_series <- function(date, indices) {
+  paste0(date, "_", sprintf("%04d", indices))
+}
 
-# RuBi - hex
-data_09_15_0000 <- read.csv2("./data/09.2025/2025-09-15_0000.csv", sep = ";",
-         dec = ".")
-data_09_15_0001 <- read.csv2("./data/09.2025/2025-09-15_0001.csv", sep = ";",
-         dec = ".")
-data_09_15_0002 <- read.csv2("./data/09.2025/2025-09-15_0002.csv", sep = ";",
-         dec = ".")
-data_09_15_0003 <- read.csv2("./data/09.2025/2025-09-15_0003.csv", sep = ";",
-         dec = ".")
-data_09_15_0004 <- read.csv2("./data/09.2025/2025-09-15_0004.csv", sep = ";",
-         dec = ".")
-data_09_15_0005 <- read.csv2("./data/09.2025/2025-09-15_0005.csv", sep = ";",
-         dec = ".")
-data_09_16_0000 <- read.csv2("./data/09.2025/2025-09-16_0000.csv", sep = ";",
-         dec = ".")
-data_09_16_0001 <- read.csv2("./data/09.2025/2025-09-16_0001.csv", sep = ";",
-         dec = ".")
-data_09_16_0002 <- read.csv2("./data/09.2025/2025-09-16_0002.csv", sep = ";",
-         dec = ".")
-data_09_16_0003 <- read.csv2("./data/09.2025/2025-09-16_0003.csv", sep = ";",
-         dec = ".")
-data_09_16_0004 <- read.csv2("./data/09.2025/2025-09-16_0004.csv", sep = ";",
-         dec = ".")
-data_09_16_0005 <- read.csv2("./data/09.2025/2025-09-16_0005.csv", sep = ";",
-         dec = ".")
-data_09_16_0006 <- read.csv2("./data/09.2025/2025-09-16_0006.csv", sep = ";",
-         dec = ".")
-data_09_16_0007 <- read.csv2("./data/09.2025/2025-09-16_0007.csv", sep = ";",
-         dec = ".")
+raw_file_stems <- c(
+  # Основні серії RuBi-Nicotine та фармакологічні порівняння.
+  file_series("2025-09-03", 1:4),
+  file_series("2025-09-09", 0:3),
+  file_series("2025-09-10", 0:5),
+  file_series("2025-09-15", 0:5),
+  file_series("2025-09-16", 0:7),
+  file_series("2025-09-17", 0:2),
+  file_series("2025-09-23", 0:2),
+  file_series("2025-09-24", 0:3),
+  file_series("2025-09-29", 0:5),
+  file_series("2025-09-30", 0:5),
+  file_series("2025-10-01", 0:5),
+  file_series("2025-10-06", c(0, 1, 3:6)),
+  file_series("2025-10-07", 0:3),
+  file_series("2025-10-08", 0:6),
+  file_series("2025-10-09", 0:6),
+  file_series("2025-10-14", 2:7),
+  file_series("2025-10-15", 0:2),
+  file_series("2025-10-28", 0:3),
+  file_series("2025-11-05", 0:3),
+  file_series("2025-11-06", 3:5),
 
-# RuBi - Caps
-data_10_06_0000 <- read.csv2("./data/09.2025/2025-10-06_0000.csv", sep = ";",
-         dec = ".")
-data_10_06_0001 <- read.csv2("./data/09.2025/2025-10-06_0001.csv", sep = ";",
-         dec = ".")
-data_10_06_0003 <- read.csv2("./data/09.2025/2025-10-06_0003.csv", sep = ";",
-         dec = ".")
-data_10_06_0004 <- read.csv2("./data/09.2025/2025-10-06_0004.csv", sep = ";",
-         dec = ".")
-data_10_06_0005 <- read.csv2("./data/09.2025/2025-10-06_0005.csv", sep = ";",
-         dec = ".")
-data_10_06_0006 <- read.csv2("./data/09.2025/2025-10-06_0006.csv", sep = ";",
-         dec = ".")
+  # Додаткові записи 2026 року.
+  file_series("2026-05-27", 2),
+  file_series("2026-06-01", c(0, 2)),
+  file_series("2026-06-02", 0:1),
+  file_series("2026-06-03", 0:1),
+  file_series("2026-06-09", 0),
+  file_series("2026-06-10", 0:1),
+  file_series("2026-06-17", 0:1),
+  file_series("2026-07-01", 0:3)
+)
 
-data_06_01_0000 <- read.csv2("./data/09.2025/2026-06-01_0000.csv", sep = ";",
-         dec = ".")
-data_05_27_0002 <- read.csv2("./data/09.2025/2026-05-27_0002.csv", sep = ";",
-         dec = ".")
+raw_object_name <- function(stem) {
+  paste0("data_", gsub("-", "_", sub("^\\d{4}-", "", stem)))
+}
 
-# RuBi - AMG9810
-data_06_01_0002 <- read.csv2("./data/09.2025/2026-06-01_0002.csv", sep = ";",
-         dec = ".")
-data_06_02_0001 <- read.csv2("./data/09.2025/2026-06-02_0001.csv", sep = ";",
-         dec = ".")
-data_06_09_0000 <- read.csv2("./data/09.2025/2026-06-09_0000.csv", sep = ";",
-         dec = ".")
-data_06_10_0001 <- read.csv2("./data/09.2025/2026-06-10_0001.csv", sep = ";",
-         dec = ".")
+read_tensometry_csv <- function(stem, data_dir = raw_data_dir) {
+  path <- file.path(data_dir, paste0(stem, ".csv"))
+  if (!file.exists(path)) stop("Не знайдено сирий файл: ", path)
 
+  data <- utils::read.csv2(path, dec = ".")
+  required_columns <- c("Time", "Trace")
+  missing_columns <- setdiff(required_columns, names(data))
+  if (length(missing_columns)) {
+    stop("У ", path, " немає колонок: ", paste(missing_columns, collapse = ", "))
+  }
+  data
+}
 
-# RuBi - CGRP
-data_09_30_0000 <- read.csv2("./data/09.2025/2025-09-30_0000.csv", sep = ";",
-         dec = ".")
-data_09_30_0001 <- read.csv2("./data/09.2025/2025-09-30_0001.csv", sep = ";",
-         dec = ".")
-data_09_30_0002 <- read.csv2("./data/09.2025/2025-09-30_0002.csv", sep = ";",
-         dec = ".")
-data_09_30_0003 <- read.csv2("./data/09.2025/2025-09-30_0003.csv", sep = ";",
-         dec = ".")
-data_09_30_0004 <- read.csv2("./data/09.2025/2025-09-30_0004.csv", sep = ";",
-         dec = ".")
-data_09_30_0005 <- read.csv2("./data/09.2025/2025-09-30_0005.csv", sep = ";",
-         dec = ".")
-data_10_01_0000 <- read.csv2("./data/09.2025/2025-10-01_0000.csv", sep = ";",
-         dec = ".")
-data_10_01_0001 <- read.csv2("./data/09.2025/2025-10-01_0001.csv", sep = ";",
-         dec = ".")
-data_10_01_0002 <- read.csv2("./data/09.2025/2025-10-01_0002.csv", sep = ";",
-         dec = ".")
-data_10_01_0003 <- read.csv2("./data/09.2025/2025-10-01_0003.csv", sep = ";",
-         dec = ".")
-data_10_01_0004 <- read.csv2("./data/09.2025/2025-10-01_0004.csv", sep = ";",
-         dec = ".")
-data_10_01_0005 <- read.csv2("./data/09.2025/2025-10-01_0005.csv", sep = ";",
-         dec = ".")
+raw_data <- setNames(
+  lapply(raw_file_stems, read_tensometry_csv),
+  vapply(raw_file_stems, raw_object_name, character(1))
+)
+list2env(raw_data, envir = .GlobalEnv)
 
-# RuBi - L703606
-data_06_02_0000 <- read.csv2("./data/09.2025/2026-06-02_0000.csv", sep = ";",
-         dec = ".")
-data_06_03_0000 <- read.csv2("./data/09.2025/2026-06-03_0000.csv", sep = ";",
-         dec = ".")
-data_06_10_0000 <- read.csv2("./data/09.2025/2026-06-10_0000.csv", sep = ";",
-         dec = ".")
+# Псевдооб'єкти потрібні лише для історично заданого порядку групування 06.11.
+# Вони навмисно посилаються на перші три записи від 05.11.
+pseudo_raw_sources <- c(
+  data_11_06_0000 = "data_11_05_0000",
+  data_11_06_0001 = "data_11_05_0001",
+  data_11_06_0002 = "data_11_05_0002"
+)
+pseudo_raw_data <- setNames(
+  mget(unname(pseudo_raw_sources), envir = .GlobalEnv),
+  names(pseudo_raw_sources)
+)
+list2env(pseudo_raw_data, envir = .GlobalEnv)
 
-# RuBi - L703606+CGRP
-data_10_09_0000 <- read.csv2("./data/09.2025/2025-10-09_0000.csv", sep = ";",
-         dec = ".")
-data_10_09_0001 <- read.csv2("./data/09.2025/2025-10-09_0001.csv", sep = ";",
-         dec = ".")
-data_10_09_0002 <- read.csv2("./data/09.2025/2025-10-09_0002.csv", sep = ";",
-         dec = ".")
-data_10_09_0003 <- read.csv2("./data/09.2025/2025-10-09_0003.csv", sep = ";",
-         dec = ".")
-data_10_09_0004 <- read.csv2("./data/09.2025/2025-10-09_0004.csv", sep = ";",
-         dec = ".")
-data_10_09_0005 <- read.csv2("./data/09.2025/2025-10-09_0005.csv", sep = ";",
-         dec = ".")
-data_10_09_0006 <- read.csv2("./data/09.2025/2025-10-09_0006.csv", sep = ";",
-         dec = ".")
-data_06_03_0001 <- read.csv2("./data/09.2025/2026-06-03_0001.csv", sep = ";",
-         dec = ".")
-
-# RuBi - Glutathione
-data_06_17_0000 <- read.csv2("./data/09.2025/2026-06-17_0000.csv", sep = ";",
-         dec = ".")
-data_06_17_0001 <- read.csv2("./data/09.2025/2026-06-17_0001.csv", sep = ";",
-         dec = ".")
-
-
+# Таблиця відповідності полегшує аудит: який фізичний CSV створив кожний data_*.
+raw_import_manifest <- data.frame(
+  Object = c(names(raw_data), names(pseudo_raw_sources)),
+  Source = c(
+    file.path(raw_data_dir, paste0(raw_file_stems, ".csv")),
+    file.path(
+      raw_data_dir,
+      sub(
+        "^data_(\\d{2})_(\\d{2})_(\\d{4})$",
+        "2025-\\1-\\2_\\3.csv",
+        unname(pseudo_raw_sources)
+      )
+    )
+  ),
+  IsPseudo = c(rep(FALSE, length(raw_data)), rep(TRUE, length(pseudo_raw_sources)))
+)
 ```
 
-```{r}
-
-# Nic, RuBi-Nic with - no epithelium
-data_09_17_0000 <- read.csv2("./data/09.2025/2025-09-17_0000.csv", sep = ";",
-         dec = ".")
-data_09_17_0001 <- read.csv2("./data/09.2025/2025-09-17_0001.csv", sep = ";",
-         dec = ".")
-data_09_17_0002 <- read.csv2("./data/09.2025/2025-09-17_0002.csv", sep = ";",
-         dec = ".")
-
-                # -----------------------
-data_10_28_0000 <- read.csv2("./data/09.2025/2025-10-28_0000.csv", sep = ";",
-         dec = ".")
-data_10_28_0001 <- read.csv2("./data/09.2025/2025-10-28_0001.csv", sep = ";",
-         dec = ".")
-data_10_28_0002 <- read.csv2("./data/09.2025/2025-10-28_0002.csv", sep = ";",
-         dec = ".")
-data_10_28_0003 <- read.csv2("./data/09.2025/2025-10-28_0003.csv", sep = ";",
-         dec = ".")
-
-                # -----------------------
-data_11_05_0000 <- read.csv2("./data/09.2025/2025-11-05_0000.csv", sep = ";",
-         dec = ".")
-data_11_05_0001 <- read.csv2("./data/09.2025/2025-11-05_0001.csv", sep = ";",
-         dec = ".")
-data_11_05_0002 <- read.csv2("./data/09.2025/2025-11-05_0002.csv", sep = ";",
-         dec = ".")
-data_11_05_0003 <- read.csv2("./data/09.2025/2025-11-05_0003.csv", sep = ";",
-         dec = ".")
-
-
-data_11_06_0000 <- read.csv2("./data/09.2025/2025-11-05_0000.csv", sep = ";",
-         dec = ".") # pseudo file for correct ordering
-data_11_06_0001 <- read.csv2("./data/09.2025/2025-11-05_0001.csv", sep = ";",
-         dec = ".") # pseudo file for correct ordering
-data_11_06_0002 <- read.csv2("./data/09.2025/2025-11-05_0002.csv", sep = ";",
-         dec = ".") # pseudo file for correct ordering
-data_11_06_0003 <- read.csv2("./data/09.2025/2025-11-06_0003.csv", sep = ";",
-         dec = ".")
-data_11_06_0004 <- read.csv2("./data/09.2025/2025-11-06_0004.csv", sep = ";",
-         dec = ".")
-data_11_06_0005 <- read.csv2("./data/09.2025/2025-11-06_0005.csv", sep = ";",
-         dec = ".")
-# RuBi - Zaf+Indo
-data_09_23_0000 <- read.csv2("./data/09.2025/2025-09-23_0000.csv", sep = ";",
-         dec = ".")
-data_09_23_0001 <- read.csv2("./data/09.2025/2025-09-23_0001.csv", sep = ";",
-         dec = ".")
-data_09_23_0002 <- read.csv2("./data/09.2025/2025-09-23_0002.csv", sep = ";",
-         dec = ".")
-                # -----------------------
-data_10_07_0000 <- read.csv2("./data/09.2025/2025-10-07_0000.csv", sep = ";",
-         dec = ".")
-data_10_07_0001 <- read.csv2("./data/09.2025/2025-10-07_0001.csv", sep = ";",
-         dec = ".")
-data_10_07_0002 <- read.csv2("./data/09.2025/2025-10-07_0002.csv", sep = ";",
-         dec = ".")
-data_10_07_0003 <- read.csv2("./data/09.2025/2025-10-07_0003.csv", sep = ";",
-         dec = ".")
-
-# RuBi - Zaf+Indo+U73122
-data_09_24_0000 <- read.csv2("./data/09.2025/2025-09-24_0000.csv", sep = ";",
-         dec = ".")
-data_09_24_0001 <- read.csv2("./data/09.2025/2025-09-24_0001.csv", sep = ";",
-         dec = ".")
-data_09_24_0002 <- read.csv2("./data/09.2025/2025-09-24_0002.csv", sep = ";",
-         dec = ".")
-data_09_24_0003 <- read.csv2("./data/09.2025/2025-09-24_0003.csv", sep = ";",
-         dec = ".")
-# RuBi - SQ
-data_09_29_0000 <- read.csv2("./data/09.2025/2025-09-29_0000.csv", sep = ";",
-         dec = ".")
-data_09_29_0001 <- read.csv2("./data/09.2025/2025-09-29_0001.csv", sep = ";",
-         dec = ".")
-data_09_29_0002 <- read.csv2("./data/09.2025/2025-09-29_0002.csv", sep = ";",
-         dec = ".")
-data_09_29_0003 <- read.csv2("./data/09.2025/2025-09-29_0003.csv", sep = ";",
-         dec = ".")
-data_09_29_0004 <- read.csv2("./data/09.2025/2025-09-29_0004.csv", sep = ";",
-         dec = ".")
-data_09_29_0005 <- read.csv2("./data/09.2025/2025-09-29_0005.csv", sep = ";",
-         dec = ".")
-
-# RuBi - Zaf+Indo+U73122
-data_10_08_0000 <- read.csv2("./data/09.2025/2025-10-08_0000.csv", sep = ";",
-         dec = ".")
-data_10_08_0001 <- read.csv2("./data/09.2025/2025-10-08_0001.csv", sep = ";",
-         dec = ".")
-data_10_08_0002 <- read.csv2("./data/09.2025/2025-10-08_0002.csv", sep = ";",
-         dec = ".")
-data_10_08_0003 <- read.csv2("./data/09.2025/2025-10-08_0003.csv", sep = ";",
-         dec = ".")
-data_10_08_0004 <- read.csv2("./data/09.2025/2025-10-08_0004.csv", sep = ";",
-         dec = ".")
-data_10_08_0005 <- read.csv2("./data/09.2025/2025-10-08_0005.csv", sep = ";",
-         dec = ".")
-data_10_08_0006 <- read.csv2("./data/09.2025/2025-10-08_0006.csv", sep = ";",
-         dec = ".")
-
-# RuBi - SQ
-data_10_15_0000 <- read.csv2("./data/09.2025/2025-10-15_0000.csv", sep = ";",
-         dec = ".")
-data_10_15_0001 <- read.csv2("./data/09.2025/2025-10-15_0001.csv", sep = ";",
-         dec = ".")
-data_10_15_0002 <- read.csv2("./data/09.2025/2025-10-15_0002.csv", sep = ";",
-         dec = ".")
-```
-
-```{r, combine}
-# --- Функція для групування файлів за n штук ---
+```{r combine_raw_files}
+# Ділить посортовані файли на послідовні блоки однакового розміру.
 group_n_files <- function(dflist, n) {
   files <- dflist[order(names(dflist))]
   split(files, ceiling(seq_along(files) / n))
 }
 
-# --- Переведення часу в секунди без повторного ділення ---
-time_to_seconds <- function(df) {
+# Переводить час із мілісекунд у секунди лише тоді, коли крок явно > 1.
+# Нечисловий Time зупиняє аналіз тут із назвою проблемного файла.
+time_to_seconds <- function(df, source = "невідомий файл") {
+  if (!is.numeric(df$Time)) {
+    stop("Колонка Time не є числовою у ", source)
+  }
   dt <- median(diff(df$Time), na.rm = TRUE)
   if (is.finite(dt) && dt > 1) df$Time <- df$Time / 1000
   df
 }
 
-# --- Функція для зсуву часу ---
+# Послідовно зсуває Time кожного файла й зшиває їх в один запис.
 combine_with_shift <- function(dflist, gap_seconds = 0.04) {
   shift <- 0
-  out <- data.frame()
-  for (df in dflist) {
+  shifted <- lapply(dflist, function(df) {
     df$Time <- df$Time + shift
     shift <- max(df$Time) + gap_seconds
-    out <- rbind(out, df)
-  }
-  out
+    df
+  })
+  dplyr::bind_rows(shifted)
 }
 
-# --- Збираємо всі data_* змінні ---
+# Для нерівномірних правил, наприклад c(3, 4), явно формуємо блоки
+# з перших трьох і наступних чотирьох файлів.
+split_files_by_rule <- function(files, rule) {
+  files <- files[order(names(files))]
+  if (length(rule) == 1) return(group_n_files(files, rule))
+
+  starts <- cumsum(c(1, head(rule, -1)))
+  Map(function(start, size) {
+    finish <- min(start + size - 1, length(files))
+    files[seq.int(start, finish)]
+  }, starts, rule)
+}
+
+# Збираємо лише сирі data_MM_DD_NNNN, а не створені нижче об'єднані записи.
 all_dfs <- mget(ls(pattern = "^data_\\d{2}_\\d{2}_\\d{4}$"))
-all_dfs <- lapply(all_dfs, time_to_seconds)
+all_dfs <- Map(time_to_seconds, all_dfs, names(all_dfs))
 list2env(all_dfs, envir = .GlobalEnv)
 
 # Виявляємо сусідні сирі файли з повністю однаковими даними.
@@ -1308,73 +1275,39 @@ if (nrow(duplicate_raw_pairs)) {
   )
 }
 
-# --- Витягаємо ключі ("09_30", "10_01", ...) ---
+# Ключ дати визначає, які сирі файли можуть належати одному запису.
 keys <- sub("^data_(\\d{2}_\\d{2})_\\d{4}$", "\\1", names(all_dfs))
-
-# --- Групуємо датафрейми за ключем ---
 grouped <- split(all_dfs, keys)
 
-# --- Визначаємо розмір груп ---
-get_group_size <- function(key) {
-  switch(key,
-         "11_06" = 3,
-         "11_05" = 2,
-         "10_28" = 2,
-         "10_15" = 3,
-         "10_14" = 3,
-         "10_09" = c(3, 4),
-         "10_08" = 4,
-         "10_07" = 4,
-         "10_06" = 3,
-         "10_01" = 3,
-         "09_30" = 3,
-         "09_29" = c(2, 4),
-         "09_24" = 4,
-         "09_23" = c(2, 1),
-         "09_17" = 2,
-         "09_16" = 4,
-         "09_15" = 3,
-         "05_27" = 1,
-         "06_01" = 1,
-         "06_02" = 1,
-         "06_03" = 1,
-         "06_09" = 1,
-         "06_10" = 1,
-         "06_17" = 1,
-          2  # значення за замовчуванням
-  )
-}
+# Кількість послідовних файлів у кожному об'єднаному записі.
+# Вектор означає блоки різного розміру: c(3, 4) -> спочатку 3, потім 4.
+grouping_rules <- list(
+  `11_06` = 3, `11_05` = 2, `10_28` = 2, `10_15` = 3,
+  `10_14` = 3, `10_09` = c(3, 4), `10_08` = 4, `10_07` = 4,
+  `10_06` = 3, `10_01` = 3, `09_30` = 3, `09_29` = c(2, 4),
+  `09_24` = 4, `09_23` = c(2, 1), `09_17` = 2, `09_16` = 4,
+  `09_15` = 3, `05_27` = 1, `06_01` = 1, `06_02` = 1,
+  `06_03` = 1, `06_09` = 1, `06_10` = 1, `06_17` = 1,
+  `07_01` = 2
+)
+default_group_size <- 2
 
-# --- Основний цикл ---
+# Створюємо об'єднані data_MM_DD_N та одночасно фіксуємо їхні джерела.
 combined_vars <- character()
 combined_sources <- list()
 
 for (k in names(grouped)) {
   files <- grouped[[k]]
-  n_rule <- get_group_size(k)
-  message(sprintf("Processing %s: %d files", k, length(files)))
+  rule <- grouping_rules[[k]]
+  if (is.null(rule)) rule <- default_group_size
+  subgroups <- split_files_by_rule(files, rule)
+  message(sprintf("Обробка %s: %d файлів -> %d записів", k, length(files), length(subgroups)))
 
-  if (length(n_rule) > 1) {
-    start_idx <- 1
-    for (i in seq_along(n_rule)) {
-      end_idx <- min(start_idx + n_rule[i] - 1, length(files))
-      sg <- files[start_idx:end_idx]
-      combined <- combine_with_shift(sg)
-      combined_name <- paste0("data_", k, "_", i)
-      assign(combined_name, combined)
-      combined_vars <- c(combined_vars, combined_name)
-      combined_sources[[combined_name]] <- names(sg)
-      start_idx <- end_idx + 1
-    }
-  } else {
-    subgroups <- group_n_files(files, n_rule)
-    for (i in seq_along(subgroups)) {
-      combined <- combine_with_shift(subgroups[[i]])
-      combined_name <- paste0("data_", k, "_", i)
-      assign(combined_name, combined)
-      combined_vars <- c(combined_vars, combined_name)
-      combined_sources[[combined_name]] <- names(subgroups[[i]])
-    }
+  for (i in seq_along(subgroups)) {
+    combined_name <- paste0("data_", k, "_", i)
+    assign(combined_name, combine_with_shift(subgroups[[i]]))
+    combined_vars <- c(combined_vars, combined_name)
+    combined_sources[[combined_name]] <- names(subgroups[[i]])
   }
 }
 
@@ -1382,6 +1315,7 @@ combined_sources_summary <- dplyr::bind_rows(lapply(names(combined_sources), fun
   data.frame(Combined = nm, Sources = paste(combined_sources[[nm]], collapse = ", "))
 }))
 
+# Контрольна таблиця для дат, де раніше траплялися помилки групування.
 print(dplyr::filter(
   combined_sources_summary,
   Combined %in% c("data_10_14_1", "data_10_14_2", "data_10_15_1")
@@ -1390,9 +1324,19 @@ print(dplyr::filter(
 
 ```
 
-```{r Nicotine}
+## 3. Конфігурація експериментальних вікон
 
-# ───────────────── Вхідні інтервали (як у тебе) ────────────────────
+У кожному `series_list_*` зовнішня назва є об'єднаним записом, а вкладені
+вектори задають межі відповідей у секундах. `kcl` використовується як
+внутрішній стандарт для нормування відповідного запису.
+
+Вирази з `max(data_...$Time)` переводять локальний час наступного сирого
+файла у спільний час зшитого запису. Число, яке віднімається від моменту
+стимулу (зазвичай 300 або 90 с), задає довжину ділянки до відповіді.
+
+```{r config_nicotine}
+
+# Вільний nicotine та записи без епітелію.
 series_list_nic <- list(
   "data_09_17_1" = list(
     kcl = c(424.59, 1154.55),
@@ -1414,9 +1358,10 @@ series_list_nic <- list(
 
 ```
 
-```{r light and no_light}
+```{r config_rubi_pair}
 
-series_list_rubi_light <- list(
+# Послідовні неопромінена й опромінена відповіді в одному препараті.
+series_list_rubi_pair <- list(
   "data_10_14_1" = list(
     kcl = c(707, 1075),
     rubi_no_light  = c(max(data_10_14_0002$Time) + 208.03 - 300,
@@ -1434,11 +1379,11 @@ series_list_rubi_light <- list(
 
 ```
 
-```{r RuBi_light in the tail}
+```{r config_tail_light}
 
 
-# ────────── Ваші інтервали (зверни увагу: для data_09_10_2 немає no_light, є min_2_light) ──────────
-series_list <- list(
+# Окреме освітлення хвоста наприкінці тривалої відповіді RuBi-Nicotine.
+series_list_tail <- list(
   "data_09_03_2" = list(
     kcl = c(66.20, 192.82),
     rubi_no_light = c(max(data_09_03_0003$Time) + 668 - 300, max(data_09_03_0003$Time) + 668 + 3600),
@@ -1471,7 +1416,7 @@ series_list <- list(
 
 ```
 
-```{r caps}
+```{r config_caps}
 
 series_list_rubi_caps <- list(
   "data_10_06_1" = list(
@@ -1500,9 +1445,11 @@ series_list_rubi_caps <- list(
 
 
 ```
-```{r amg}
+```{r config_amg}
 
-series_list_rubi_caps <- list(
+# AMG8910. Два елементи data_06_01_2 залишені окремо, бо задають різні
+# часові вікна одного об'єднаного запису.
+series_list_rubi_amg <- list(
   "data_06_01_2" = list(
     kcl = c(2000, 2000 + 411),
     amg  = c(7747 - 300, 7747 + 1540)
@@ -1525,7 +1472,7 @@ series_list_rubi_caps <- list(
 
 ```
 
-```{r cgrp}
+```{r config_cgrp}
 
 series_list_rubi_cgrp <- list(
   "data_09_30_1" = list(
@@ -1554,7 +1501,7 @@ series_list_rubi_cgrp <- list(
 
 ```
 
-```{r L703606}
+```{r config_l703606}
 
 series_list_l703606 <- list(
   "data_06_02_1" = list(
@@ -1574,7 +1521,7 @@ series_list_l703606 <- list(
 
 ```
 
-```{r CGRP_L703606}
+```{r config_cgrp_l703606}
 
 series_list_cgrp_l703606 <- list(
   "data_10_09_1" = list(
@@ -1595,7 +1542,7 @@ series_list_cgrp_l703606 <- list(
 )
 ```
 
-```{r Glutathione}
+```{r config_glutathione}
 
 series_list_glutathione <- list(
   "data_06_17_1" = list(
@@ -1611,13 +1558,28 @@ series_list_glutathione <- list(
     glutathione  = c(8351.44 - 300, 8351.44 + 1452),
     glutathione_h2o2_100 = c(10298.50 - 90, 10298.50 + 122.23),
     glutathione_h2o2_1000 = c(10810.99 - 90, 10810.99 + 122.23)
+  ),
+  "data_07_01_1" = list(
+    kcl = c(2603.17, 2603.17 + 222),
+    rubi_no_light = c(4653.20 - 300, 4653.20 + 1592.87)#,
+    #glutathione  = c(10860.48 - 300, 10860.48 + 1613.08),
+    #h2o2_100 = c(10298.50 - 90, 10298.50 + 122.23),
+    #h2o2_1000 = c(10810.99 - 90, 10810.99 + 122.23)
+  ),
+  "data_07_01_2" = list(
+    kcl = c(1759.44, 1759.44 + 325.16),
+    rubi_no_light = c(3080.78 - 300, 3080.78 + 1915.74)#,
+    #glutathione  = c(3080.78 - 300, 3080.78 + 1915.74),
+    #glutathione_h2o2_100 = c(10298.50 - 90, 10298.50 + 122.23),
+    #glutathione_h2o2_1000 = c(10810.99 - 90, 10810.99 + 122.23)
   )
 )
 
 
 ```
 
-```{r another rubi light}
+```{r config_rubi_light}
+# Основна сукупність опромінених відповідей RuBi-Nicotine.
 series_list_rubi_light <- list(
   "data_09_15_1" = list(
     kcl = c(408, 408 + 970),
@@ -1668,17 +1630,31 @@ series_list_rubi_light <- list(
 )
 ```
 
-```{r exponential_baseline_correction, fig.width=10, fig.height=7}
-rmd_path <- if (requireNamespace("knitr", quietly = TRUE)) knitr::current_input() else NULL
-if (is.null(rmd_path) || !file.exists(rmd_path)) {
-  rmd_path <- "trachea_2025_import_combine.Rmd"
-}
+```{r register_series}
+# Єдиний реєстр усіх серій. Подальші chunk проходять саме по цьому списку,
+# тому аналіз більше не перечитує й не парсить власний Rmd-файл.
+series_defs <- list(
+  list(name = "series_list_nic", value = series_list_nic),
+  list(name = "series_list_rubi_pair", value = series_list_rubi_pair),
+  list(name = "series_list_tail", value = series_list_tail),
+  list(name = "series_list_rubi_caps", value = series_list_rubi_caps),
+  list(name = "series_list_rubi_amg", value = series_list_rubi_amg),
+  list(name = "series_list_rubi_cgrp", value = series_list_rubi_cgrp),
+  list(name = "series_list_l703606", value = series_list_l703606),
+  list(name = "series_list_cgrp_l703606", value = series_list_cgrp_l703606),
+  list(name = "series_list_glutathione", value = series_list_glutathione),
+  list(name = "series_list_rubi_light", value = series_list_rubi_light)
+)
+```
 
-series_defs_for_baseline <- collect_series_lists_from_rmd(rmd_path)
+## 4. Корекція базової лінії
+
+```{r exponential_baseline_correction, fig.width=10, fig.height=7}
 response_intervals <- list()
 
-# Збираємо всі вказані ділянки відповідей окремо для кожного об'єднаного запису.
-for (def in series_defs_for_baseline) {
+# Усі KCl і фармакологічні вікна вважаються біологічними відповідями та
+# автоматично виключаються з первинного набору точок для baseline-fit.
+for (def in series_defs) {
   samples <- def$value
   sample_names <- names(samples)
   if (is.null(sample_names)) sample_names <- paste0("sample_", seq_along(samples))
@@ -1705,6 +1681,9 @@ for (def in series_defs_for_baseline) {
   }
 }
 
+# Підбирає baseline як константу плюс одну або дві експоненти.
+# Сталі часу оптимізуються нелінійно, а амплітуди при фіксованих tau - через lm.fit.
+# Друга експонента приймається лише за покращення AIC щонайменше на 2.
 fit_exponential_baseline <- function(time, trace, baseline_mask,
                                      max_components = 2,
                                      max_fit_points = 4000) {
@@ -1780,6 +1759,7 @@ fit_exponential_baseline <- function(time, trace, baseline_mask,
   best
 }
 
+# Локальний одноекспоненційний варіант для передстимульної ділянки H2O2.
 correct_pre_response_exponential <- function(d, onset_time,
                                              time_col = "TimeRubi",
                                              value_col = "TraceNormKCl0",
@@ -1809,6 +1789,10 @@ baseline_windows <- function(...) {
 }
 
 baseline_default_start <- 50
+# Індивідуальні налаштування baseline:
+# start - перша дозволена секунда;
+# include - додаткові ділянки, які точно належать baseline;
+# exclude - артефакти або відповіді, які не можна використовувати у fit.
 baseline_settings <- list(
   data_05_27_1 = list(start = 130, include = baseline_windows(c(4900, 5700))),
   data_06_01_1 = list(start = 97, include = baseline_windows(c(4900, 5700)),
@@ -1869,6 +1853,8 @@ baseline_settings <- list(
 )
 
 baseline_summary_parts <- list()
+# Обробляємо й показуємо лише записи, згадані хоча б в одному series_list_*.
+# Невикористані об'єднані data_* не потрапляють до baseline-графіків.
 analysis_vars <- intersect(combined_vars, names(response_intervals))
 
 for (series_name in analysis_vars) {
@@ -1897,6 +1883,8 @@ for (series_name in analysis_vars) {
   }
 
   finite_mask <- is.finite(d$Time) & is.finite(d$Trace_raw)
+  # Основний fit використовує ранню ділянку до першої наступної відповіді,
+  # щоб пізні відмивки та поступове розслаблення не зміщували baseline.
   baseline_mask <- finite_mask &
     d$Time >= series_baseline_start & d$Time < baseline_end
 
@@ -1907,6 +1895,7 @@ for (series_name in analysis_vars) {
     }
   }
 
+  # include повертає у fit пізні фрагменти, вручну підтверджені як baseline.
   if (!is.null(include_windows)) {
     for (i in seq_len(nrow(include_windows))) {
       baseline_mask <- baseline_mask |
@@ -1914,6 +1903,7 @@ for (series_name in analysis_vars) {
     }
   }
 
+  # exclude застосовується останнім і має найвищий пріоритет.
   if (!is.null(exclude_windows)) {
     for (i in seq_len(nrow(exclude_windows))) {
       baseline_mask <- baseline_mask &
@@ -2008,7 +1998,7 @@ for (series_name in analysis_vars) {
     axes_from_origin(d, "Time")
 
   p_baseline_correction <- p_raw_baseline / p_corrected
-  print(p_baseline_correction)
+  show_plot(p_baseline_correction)
   save_group_plot(
     p_baseline_correction, "baseline", series_name,
     width = 10, height = 7
@@ -2019,17 +2009,13 @@ baseline_summary <- dplyr::bind_rows(baseline_summary_parts)
 print(baseline_summary)
 ```
 
-```{r all_kcl_overlay, fig.width=10, fig.height=6}
-rmd_path <- if (requireNamespace("knitr", quietly = TRUE)) knitr::current_input() else NULL
-if (is.null(rmd_path) || !file.exists(rmd_path)) {
-  rmd_path <- "trachea_2025_import_combine.Rmd"
-}
+## 5. Контроль KCl і нормування відповідей
 
-series_defs <- collect_series_lists_from_rmd(rmd_path)
+```{r all_kcl_overlay, fig.width=10, fig.height=6}
+# Збираємо всі KCl-вікна з реєстру, очищаємо їх від міток і оцінюємо
+# амплітуду як max - min для подальшого нормування відповідей.
 kcl_parts <- list()
 kcl_amp_parts <- list()
-marker_range <- c(4.6, 5.6)
-
 for (def_i in seq_along(series_defs)) {
   def <- series_defs[[def_i]]
   samples <- def$value
@@ -2119,23 +2105,20 @@ p_kcl_amplitudes <- ggplot(kcl_amplitudes, aes(AmplitudeKCl)) +
   presentation_theme() +
   axes_from_origin(kcl_amplitudes, "AmplitudeKCl")
 
-print(p_kcl_overlay)
-print(p_kcl_amplitudes)
+show_plot(p_kcl_overlay)
+show_plot(p_kcl_amplitudes)
 save_group_plot(p_kcl_overlay, "kcl", "all_kcl_responses")
 save_group_plot(p_kcl_amplitudes, "kcl", "kcl_amplitude_distribution")
 ```
 
-```{r rubi_light_norm_by_kcl, fig.width=10, fig.height=6}
-if (!exists("marker_range")) marker_range <- c(4.6, 5.6)
-if (!exists("rmd_path") || is.null(rmd_path) || !file.exists(rmd_path)) {
-  rmd_path <- if (requireNamespace("knitr", quietly = TRUE)) knitr::current_input() else NULL
-  if (is.null(rmd_path) || !file.exists(rmd_path)) {
-    rmd_path <- "trachea_2025_import_combine.Rmd"
-  }
-}
+## 6. RuBi-Nicotine: основні групи
 
-series_defs <- collect_series_lists_from_rmd(rmd_path)
+### Опромінені записи
+
+```{r rubi_light_norm_by_kcl, fig.width=10, fig.height=6}
 rubi_parts <- list()
+# Порожній список означає, що всі активні rubi_light із валідним KCl входять
+# до основного аналізу. Ідентифікатор виключення має формат list:sample.
 exclude_rubi_light <- character()
 
 for (def_i in seq_along(series_defs)) {
@@ -2154,6 +2137,7 @@ for (def_i in seq_along(series_defs)) {
     rubi_d <- extract_clean_window(sample_name, item$rubi_light, marker_range = marker_range)
     if (is.null(kcl_d) || is.null(rubi_d)) next
 
+    # Кожна відповідь нормується лише на KCl того самого препарату.
     amp_kcl <- max(kcl_d$Trace, na.rm = TRUE) - min(kcl_d$Trace, na.rm = TRUE)
     if (!is.finite(amp_kcl) || amp_kcl <= 0) next
 
@@ -2182,6 +2166,7 @@ for (def_i in seq_along(series_defs)) {
 rubi_light_norm <- dplyr::bind_rows(rubi_parts)
 if (!nrow(rubi_light_norm)) stop("Не знайдено rubi_light із відповідним kcl у тому самому list.")
 
+# Невеликі ручні похибки у встановленні вікон компенсуємо за похідною.
 rubi_light_alignment_result <- align_curves_by_derivative(
   rubi_light_norm,
   expected_onset = expected_response_onset("rubi_light")
@@ -2203,6 +2188,7 @@ rubi_light_curve_summary <- rubi_light_norm %>%
 
 print(utils::head(rubi_light_curve_summary, 10))
 
+# Усереднення відбувається після очищення, KCl-нормування та синхронізації.
 rubi_light_mean <- make_mean_curve(
   split(rubi_light_norm, rubi_light_norm$Curve),
   time_col = "TimeRubi",
@@ -2236,241 +2222,171 @@ p_rubi_light_norm <- ggplot(rubi_light_plot_data, aes(TimeRubi, TraceNormKCl0, g
   presentation_theme() +
   axes_from_origin(rubi_light_norm, "TimeRubi")
 
-print(p_rubi_light_norm)
+show_plot(p_rubi_light_norm)
 save_group_plot(p_rubi_light_norm, "rubi_light", "individual_curves_and_mean")
 ```
 
-```{r rubi_light_cluster_check, fig.width=10, fig.height=6}
-curve_value_at <- function(time, value, target_time) {
-  approx(time, value, xout = target_time, rule = 2, ties = mean)$y
+### Опромінені записи за ділянкою трахеї
+
+```{r rubi_light_by_drug_region, fig.width=10, fig.height=6}
+# Ділянка трахеї записана для фізичного CSV. Через combined_sources
+# ця ознака переноситься на відповідну нормовану криву об'єднаного запису.
+drug_region_by_file <- tibble::tribble(
+  ~SourceFile, ~DrugRegion,
+  "2026-05-27_0002", 2,
+  "2026-06-01_0000", 3,
+  "2026-06-01_0002", 2,
+  "2026-06-02_0000", 3,
+  "2026-06-02_0001", 2,
+  "2026-06-03_0000", 3,
+  "2026-06-03_0001", 2,
+  "2026-06-09_0000", 3,
+  "2026-06-09_0001", 2,
+  "2026-06-09_0002", 1,
+  "2026-06-10_0000", 3,
+  "2026-06-10_0001", 2,
+  "2026-06-16_0000", 3,
+  "2026-06-16_0001", 2,
+  "2026-06-17_0000", 3,
+  "2026-06-17_0001", 2,
+  "2026-07-01_0000", 3,
+  "2026-07-01_0001", 3,
+  "2026-07-01_0002", 2,
+  "2026-07-01_0003", 2
+)
+
+raw_var_to_source_file <- function(raw_var) {
+  m <- regexec("^data_(\\d{2})_(\\d{2})_(\\d{4})$", raw_var)
+  parts <- regmatches(raw_var, m)[[1]]
+  if (length(parts) != 4) return(NA_character_)
+
+  year <- if (parts[2] %in% c("05", "06", "07")) "2026" else "2025"
+  paste0(year, "-", parts[2], "-", parts[3], "_", parts[4])
 }
 
-summarise_rubi_light_curve <- function(d) {
-  d <- d[order(d$TimeRubi), ]
-  time <- d$TimeRubi
-  value <- d$TraceNormKCl0
-  max_value <- max(value, na.rm = TRUE)
-  peak_idx <- which.max(value)
-  half_max <- 0.5 * max_value
-  t50_idx <- which(value >= half_max)[1]
-
+combined_sources_long <- dplyr::bind_rows(lapply(names(combined_sources), function(sample_name) {
   data.frame(
-    Curve = d$Curve[1],
-    Sample = d$Sample[1],
-    SeriesList = d$SeriesList[1],
-    Max = max_value,
-    T_peak = time[peak_idx],
-    T50 = time[t50_idx],
-    Y600 = curve_value_at(time, value, 600),
-    Y1200 = curve_value_at(time, value, 1200),
-    Y1500 = curve_value_at(time, value, 1500),
-    DropFromPeak = max_value - curve_value_at(time, value, min(max(time), 1500)),
-    AmplitudeKCl = d$AmplitudeKCl[1]
+    Sample = sample_name,
+    RawSource = combined_sources[[sample_name]],
+    SourceFile = vapply(combined_sources[[sample_name]], raw_var_to_source_file, character(1))
   )
-}
+}))
 
-make_rubi_light_clusters <- function(rubi_data, n_clusters) {
-  features <- dplyr::bind_rows(lapply(
-    split(rubi_data, rubi_data$Curve),
-    summarise_rubi_light_curve
-  ))
+used_analysis_samples <- unique(unlist(lapply(series_defs, function(def) names(def$value))))
+used_analysis_sources <- combined_sources_long %>%
+  dplyr::filter(Sample %in% used_analysis_samples)
 
-  feature_cols <- c(
-    "Max", "T_peak", "T50", "Y600", "Y1200", "Y1500", "DropFromPeak"
+ignored_drug_region_files <- drug_region_by_file %>%
+  dplyr::anti_join(
+    dplyr::distinct(used_analysis_sources, SourceFile),
+    by = "SourceFile"
   )
-  feature_mat <- as.matrix(features[, feature_cols])
-  for (j in seq_len(ncol(feature_mat))) {
-    feature_mat[!is.finite(feature_mat[, j]), j] <- median(
-      feature_mat[, j], na.rm = TRUE
-    )
-  }
 
-  set.seed(1)
-  km <- stats::kmeans(scale(feature_mat), centers = n_clusters, nstart = 100)
-  features$ClusterRaw <- km$cluster
+rubi_light_region_by_sample <- combined_sources_long %>%
+  dplyr::filter(Sample %in% unique(rubi_light_norm$Sample)) %>%
+  dplyr::inner_join(drug_region_by_file, by = "SourceFile") %>%
+  dplyr::group_by(Sample) %>%
+  dplyr::summarise(
+    DrugRegion = if (dplyr::n_distinct(DrugRegion) == 1) dplyr::first(DrugRegion) else NA_real_,
+    SourceFiles = paste(unique(SourceFile), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(DrugRegion %in% c(2, 3))
 
-  cluster_stats <- features %>%
-    dplyr::group_by(ClusterRaw) %>%
-    dplyr::summarise(
-      Max = mean(Max, na.rm = TRUE),
-      T_peak = mean(T_peak, na.rm = TRUE),
-      DropFromPeak = mean(DropFromPeak, na.rm = TRUE),
-      .groups = "drop"
-    )
+rubi_light_region_norm <- rubi_light_norm %>%
+  dplyr::inner_join(rubi_light_region_by_sample, by = "Sample") %>%
+  dplyr::mutate(
+    RegionLabel = paste0("Ділянка ", DrugRegion)
+  )
 
-  if (n_clusters == 2) {
-    cluster_stats <- cluster_stats %>%
-      dplyr::arrange(dplyr::desc(Max)) %>%
-      dplyr::mutate(ClusterLabel = c("Вища відповідь", "Нижча відповідь"))
-  } else {
-    early_raw <- cluster_stats$ClusterRaw[which.max(cluster_stats$DropFromPeak)]
-    high_raw <- cluster_stats$ClusterRaw[
-      which.max(ifelse(cluster_stats$ClusterRaw == early_raw, -Inf, cluster_stats$Max))
-    ]
-    cluster_stats$ClusterLabel <- "Помірна тривала відповідь"
-    cluster_stats$ClusterLabel[cluster_stats$ClusterRaw == high_raw] <- "Висока тривала відповідь"
-    cluster_stats$ClusterLabel[cluster_stats$ClusterRaw == early_raw] <- "Рання/транзиторна відповідь"
-  }
+print(ignored_drug_region_files)
+print(rubi_light_region_by_sample)
 
-  features <- features %>%
-    dplyr::left_join(cluster_stats[, c("ClusterRaw", "ClusterLabel")],
-                     by = "ClusterRaw")
-
-  rubi_clustered <- rubi_data %>%
-    dplyr::left_join(features[, c("Curve", "ClusterLabel")], by = "Curve")
-
-  cluster_means <- dplyr::bind_rows(lapply(
-    split(rubi_clustered, rubi_clustered$ClusterLabel),
+if (nrow(rubi_light_region_norm)) {
+  rubi_light_region_means <- dplyr::bind_rows(lapply(
+    split(rubi_light_region_norm, rubi_light_region_norm$RegionLabel),
     function(d) {
       m <- make_mean_curve(
         split(d, d$Curve),
         time_col = "TimeRubi",
         value_col = "TraceNormKCl0"
       )
-      m$ClusterLabel <- d$ClusterLabel[1]
-      m$N_curves <- dplyr::n_distinct(d$Curve)
+      m$RegionLabel <- unique(d$RegionLabel)
+      m$DrugRegion <- unique(d$DrugRegion)
       m
     }
   ))
 
-  list(features = features, data = rubi_clustered, mean = cluster_means)
+  rubi_light_region_counts <- rubi_light_region_norm %>%
+    dplyr::distinct(RegionLabel, Curve) %>%
+    dplyr::count(RegionLabel, name = "N")
+
+  region_colors <- c("Ділянка 2" = "#0077B6", "Ділянка 3" = "#E31A1C")
+  rubi_light_region_plot_data <- thin_plot_data(
+    rubi_light_region_norm,
+    group_col = "Curve",
+    max_points = 4000
+  )
+
+  p_rubi_light_by_region <- ggplot(
+    rubi_light_region_plot_data,
+    aes(TimeRubi, TraceNormKCl0, group = Curve, color = RegionLabel)
+  ) +
+    light_band_layer() +
+    geom_line(alpha = 0.35, linewidth = 0.55) +
+    geom_ribbon(
+      data = rubi_light_region_means,
+      aes(TimeRubi, ymin = CI_low, ymax = CI_high, fill = RegionLabel),
+      inherit.aes = FALSE,
+      alpha = 0.16,
+      color = NA
+    ) +
+    geom_line(
+      data = rubi_light_region_means,
+      aes(TimeRubi, Mean, color = RegionLabel),
+      inherit.aes = FALSE,
+      linewidth = 1.35
+    ) +
+    scale_color_manual(values = region_colors, name = NULL) +
+    scale_fill_manual(values = region_colors, guide = "none") +
+    labs(
+      title = "Опромінений RuBi-Nicotine за ділянкою препарату",
+      subtitle = paste(
+        paste0(rubi_light_region_counts$RegionLabel, ": n = ", rubi_light_region_counts$N),
+        collapse = "; "
+      ),
+      x = "Час від початку відповіді, с",
+      y = "Нормована відповідь"
+    ) +
+    presentation_theme() +
+    axes_from_origin(rubi_light_region_norm, "TimeRubi")
+
+  show_plot(p_rubi_light_by_region)
+  save_group_plot(
+    p_rubi_light_by_region,
+    "rubi_light/regions",
+    "rubi_light_by_drug_region_2_3"
+  )
+} else {
+  message(
+    "Не знайдено rubi_light-кривих із використаних записів, ",
+    "для яких задано ділянку препарату 2 або 3."
+  )
 }
-
-rubi_light_clusters_2 <- make_rubi_light_clusters(rubi_light_norm, 2)
-rubi_light_clusters_3 <- make_rubi_light_clusters(rubi_light_norm, 3)
-
-print(rubi_light_clusters_2$features %>%
-  dplyr::count(ClusterLabel, name = "N"))
-print(rubi_light_clusters_3$features %>%
-  dplyr::arrange(ClusterLabel, dplyr::desc(Max)) %>%
-  dplyr::select(ClusterLabel, Sample, SeriesList, Max, T_peak, T50, Y600, Y1200,
-                DropFromPeak, AmplitudeKCl))
-
-cluster_colors_2 <- c(
-  "Вища відповідь" = "#E31A1C",
-  "Нижча відповідь" = "#0077B6"
-)
-cluster_colors_3 <- c(
-  "Висока тривала відповідь" = "#E31A1C",
-  "Помірна тривала відповідь" = "#0077B6",
-  "Рання/транзиторна відповідь" = "#FFB000"
-)
-
-rubi_light_cluster_plot_data <- thin_plot_data(
-  rubi_light_clusters_3$data,
-  group_col = "Curve",
-  max_points = 4000
-)
-
-p_rubi_light_clusters_individual <- ggplot(
-  rubi_light_cluster_plot_data,
-  aes(TimeRubi, TraceNormKCl0, group = Curve, color = ClusterLabel)
-) +
-  light_band_layer() +
-  geom_line(alpha = 0.45, linewidth = 0.6) +
-  geom_ribbon(
-    data = rubi_light_clusters_3$mean,
-    aes(TimeRubi, ymin = CI_low, ymax = CI_high, fill = ClusterLabel),
-    inherit.aes = FALSE,
-    alpha = 0.16,
-    color = NA
-  ) +
-  geom_line(
-    data = rubi_light_clusters_3$mean,
-    aes(TimeRubi, Mean, color = ClusterLabel),
-    inherit.aes = FALSE,
-    linewidth = 1.4
-  ) +
-  scale_color_manual(values = cluster_colors_3, name = NULL) +
-  scale_fill_manual(values = cluster_colors_3, guide = "none") +
-  labs(
-    title = "Опромінений RuBi-Nicotine: перевірка 3 підгруп",
-    subtitle = "Тонкі лінії - окремі криві; товсті лінії - середні по підгрупах",
-    x = "Час від початку відповіді, с",
-    y = "Нормована відповідь"
-  ) +
-  presentation_theme() +
-  axes_from_origin(rubi_light_clusters_3$data, "TimeRubi")
-
-p_rubi_light_cluster_means_2 <- ggplot(
-  rubi_light_clusters_2$mean,
-  aes(TimeRubi, Mean, color = ClusterLabel)
-) +
-  light_band_layer() +
-  geom_ribbon(
-    aes(ymin = CI_low, ymax = CI_high, fill = ClusterLabel),
-    alpha = 0.18,
-    color = NA
-  ) +
-  geom_line(linewidth = 1.4) +
-  scale_color_manual(values = cluster_colors_2, name = NULL) +
-  scale_fill_manual(values = cluster_colors_2, guide = "none") +
-  labs(
-    title = "Опромінений RuBi-Nicotine: середні криві 2 підгруп",
-    x = "Час від початку відповіді, с",
-    y = "Середня нормована відповідь"
-  ) +
-  presentation_theme() +
-  axes_from_origin(rubi_light_clusters_2$mean, "TimeRubi")
-
-p_rubi_light_cluster_means_3 <- ggplot(
-  rubi_light_clusters_3$mean,
-  aes(TimeRubi, Mean, color = ClusterLabel)
-) +
-  light_band_layer() +
-  geom_ribbon(
-    aes(ymin = CI_low, ymax = CI_high, fill = ClusterLabel),
-    alpha = 0.18,
-    color = NA
-  ) +
-  geom_line(linewidth = 1.4) +
-  scale_color_manual(values = cluster_colors_3, name = NULL) +
-  scale_fill_manual(values = cluster_colors_3, guide = "none") +
-  labs(
-    title = "Опромінений RuBi-Nicotine: середні криві 3 підгруп",
-    x = "Час від початку відповіді, с",
-    y = "Середня нормована відповідь"
-  ) +
-  presentation_theme() +
-  axes_from_origin(rubi_light_clusters_3$mean, "TimeRubi")
-
-print(p_rubi_light_clusters_individual)
-print(p_rubi_light_cluster_means_2)
-print(p_rubi_light_cluster_means_3)
-
-save_group_plot(
-  p_rubi_light_clusters_individual,
-  "rubi_light",
-  "cluster_check_individual_curves_3_groups"
-)
-save_group_plot(
-  p_rubi_light_cluster_means_2,
-  "rubi_light",
-  "cluster_check_mean_curves_2_groups"
-)
-save_group_plot(
-  p_rubi_light_cluster_means_3,
-  "rubi_light",
-  "cluster_check_mean_curves_3_groups"
-)
 ```
 
-```{r rubi_no_light_norm_by_kcl, fig.width=10, fig.height=6}
-if (!exists("marker_range")) marker_range <- c(4.6, 5.6)
-if (!exists("rmd_path") || is.null(rmd_path) || !file.exists(rmd_path)) {
-  rmd_path <- if (requireNamespace("knitr", quietly = TRUE)) knitr::current_input() else NULL
-  if (is.null(rmd_path) || !file.exists(rmd_path)) {
-    rmd_path <- "trachea_2025_import_combine.Rmd"
-  }
-}
+### Неопромінені записи
 
-series_defs <- collect_series_lists_from_rmd(rmd_path)
+```{r rubi_no_light_norm_by_kcl, fig.width=10, fig.height=6}
 rubi_no_parts <- list()
+rubi_no_all_parts <- list()
+# Основна очищена група не містить трьох амплітудних викидів. Повний набір
+# паралельно зберігається у rubi_no_light_norm_all для exploratory-аналізу y420.
 exclude_rubi_no_light <- c(
   # Виключено через надзвичайно високу нормалізовану амплітуду.
-  "series_list:data_09_09_1",
-  "series_list:data_09_09_2",
-  "series_list_rubi_light:data_10_14_2"
+  "series_list_tail:data_09_09_1",
+  "series_list_tail:data_09_09_2",
+  "series_list_rubi_pair:data_10_14_2"
 )
 if (!exists("rubi_light_duration") || !is.finite(rubi_light_duration) || rubi_light_duration <= 0) {
   rubi_light_duration <- max(rubi_light_mean$TimeRubi, na.rm = TRUE)
@@ -2486,7 +2402,8 @@ for (def_i in seq_along(series_defs)) {
     sample_name <- sample_names[i]
     item <- samples[[i]]
     if (!is.list(item) || is.null(item$kcl) || is.null(item$rubi_no_light)) next
-    if (paste(def$name, sample_name, sep = ":") %in% exclude_rubi_no_light) next
+    excluded_from_primary <- paste(def$name, sample_name, sep = ":") %in%
+      exclude_rubi_no_light
 
     kcl_d <- extract_clean_window(sample_name, item$kcl, marker_range = marker_range)
     rubi_d <- extract_clean_window(sample_name, item$rubi_no_light, marker_range = marker_range)
@@ -2508,13 +2425,32 @@ for (def_i in seq_along(series_defs)) {
     rubi_d$Sample <- sample_name
     rubi_d$Curve <- paste(def_i, i, def$name, sample_name, sep = ": ")
     rubi_d$AmplitudeKCl <- amp_kcl
+    rubi_d$ExcludedFromPrimary <- excluded_from_primary
 
-    rubi_no_parts[[length(rubi_no_parts) + 1]] <- rubi_d[, c(
-      "TimeRubi", "TraceNormKCl0", "SeriesList", "Sample", "Curve", "AmplitudeKCl"
+    rubi_no_all_parts[[length(rubi_no_all_parts) + 1]] <- rubi_d[, c(
+      "TimeRubi", "TraceNormKCl0", "SeriesList", "Sample", "Curve",
+      "AmplitudeKCl", "ExcludedFromPrimary"
     )]
+    if (!excluded_from_primary) {
+      rubi_no_parts[[length(rubi_no_parts) + 1]] <-
+        rubi_no_all_parts[[length(rubi_no_all_parts)]]
+    }
   }
 }
 
+# Повний набір потрібний лише режиму "усі записи" експериментального аналізу.
+rubi_no_light_norm_all <- dplyr::bind_rows(rubi_no_all_parts)
+if (!nrow(rubi_no_light_norm_all)) {
+  stop("Не знайдено жодного rubi_no_light із відповідним kcl.")
+}
+rubi_no_light_all_alignment_result <- align_curves_by_derivative(
+  rubi_no_light_norm_all,
+  expected_onset = expected_response_onset("rubi_no_light")
+)
+rubi_no_light_norm_all <- rubi_no_light_all_alignment_result$data
+rubi_no_light_all_alignment_summary <- rubi_no_light_all_alignment_result$summary
+
+# Очищений набір використовується в основних графіках і статистиці.
 rubi_no_light_norm <- dplyr::bind_rows(rubi_no_parts)
 if (!nrow(rubi_no_light_norm)) stop("Не знайдено rubi_no_light із відповідним kcl у тому самому list.")
 
@@ -2573,184 +2509,209 @@ p_rubi_no_light_norm <- ggplot(rubi_no_light_plot_data, aes(TimeRubi, TraceNormK
   presentation_theme() +
   axes_from_origin(rubi_no_light_norm, "TimeRubi")
 
-print(p_rubi_no_light_norm)
+show_plot(p_rubi_no_light_norm)
 save_group_plot(p_rubi_no_light_norm, "rubi_no_light", "individual_curves_and_mean")
 ```
 
-```{r rubi_light_subgroups_vs_no_light_mean, fig.width=10, fig.height=6}
-cluster_label_slug <- function(x) {
-  dplyr::case_when(
-    x == "Вища відповідь" ~ "higher_response",
-    x == "Нижча відповідь" ~ "lower_response",
-    x == "Висока тривала відповідь" ~ "high_sustained_response",
-    x == "Помірна тривала відповідь" ~ "moderate_sustained_response",
-    x == "Рання/транзиторна відповідь" ~ "early_transient_response",
-    TRUE ~ gsub("[^A-Za-z0-9]+", "_", x)
+### Неопромінені записи за ділянкою трахеї
+
+```{r rubi_no_light_by_drug_region, fig.width=10, fig.height=6}
+drug_region_by_sample <- tibble::tribble(
+  ~Sample, ~DrugRegion,
+  "data_07_01_1", 3,
+  "data_07_01_2", 2
+)
+
+if (!exists("drug_region_by_file")) {
+  drug_region_by_file <- tibble::tribble(
+    ~SourceFile, ~DrugRegion,
+    "2026-05-27_0002", 2,
+    "2026-06-01_0000", 3,
+    "2026-06-01_0002", 2,
+    "2026-06-02_0000", 3,
+    "2026-06-02_0001", 2,
+    "2026-06-03_0000", 3,
+    "2026-06-03_0001", 2,
+    "2026-06-09_0000", 3,
+    "2026-06-09_0001", 2,
+    "2026-06-09_0002", 1,
+    "2026-06-10_0000", 3,
+    "2026-06-10_0001", 2,
+    "2026-06-16_0000", 3,
+    "2026-06-16_0001", 2,
+    "2026-06-17_0000", 3,
+    "2026-06-17_0001", 2,
+    "2026-07-01_0000", 3,
+    "2026-07-01_0001", 3,
+    "2026-07-01_0002", 2,
+    "2026-07-01_0003", 2
   )
 }
 
-make_light_cluster_vs_no_light_mean_plots <- function(light_clusters,
-                                                      n_clusters,
-                                                      cluster_colors) {
-  cluster_order <- names(cluster_colors)
-  cluster_order <- cluster_order[cluster_order %in% unique(light_clusters$mean$ClusterLabel)]
+if (!exists("raw_var_to_source_file")) {
+  raw_var_to_source_file <- function(raw_var) {
+    m <- regexec("^data_(\\d{2})_(\\d{2})_(\\d{4})$", raw_var)
+    parts <- regmatches(raw_var, m)[[1]]
+    if (length(parts) != 4) return(NA_character_)
 
-  plots <- lapply(cluster_order, function(cluster_label) {
-    light_d <- light_clusters$mean %>%
-      dplyr::filter(ClusterLabel == cluster_label) %>%
-      dplyr::mutate(Condition = "rubi_light")
-    no_light_d <- rubi_no_light_mean %>%
-      dplyr::mutate(ClusterLabel = cluster_label, Condition = "rubi_no_light")
-    d <- dplyr::bind_rows(light_d, no_light_d)
-    n_light <- light_clusters$features %>%
-      dplyr::filter(ClusterLabel == cluster_label) %>%
-      dplyr::pull(Curve) %>%
-      dplyr::n_distinct()
-    n_no_light <- dplyr::n_distinct(rubi_no_light_norm$Curve)
-
-    ggplot(d, aes(TimeRubi, Mean, color = Condition)) +
-      light_band_layer() +
-      geom_ribbon(
-        aes(ymin = CI_low, ymax = CI_high, fill = Condition),
-        alpha = 0.16,
-        color = NA
-      ) +
-      geom_line(linewidth = 1.45) +
-      condition_color_scale(breaks = c("rubi_light", "rubi_no_light")) +
-      condition_fill_scale(breaks = c("rubi_light", "rubi_no_light")) +
-      labs(
-        title = paste0("Підгрупа опроміненого RuBi-Nicotine: ", cluster_label),
-        subtitle = paste0(
-          n_clusters,
-          " підгрупи; n опроміненого = ", n_light,
-          ", n неопроміненого = ", n_no_light,
-          "; Δ = опромінений - неопромінений"
-        ),
-        x = "Час від початку відповіді, с",
-        y = "Середня нормована відповідь"
-      ) +
-      presentation_theme() +
-      axes_from_origin(d, "TimeRubi")
-  })
-  names(plots) <- cluster_label_slug(cluster_order)
-  plots
+    year <- if (parts[2] %in% c("05", "06", "07")) "2026" else "2025"
+    paste0(year, "-", parts[2], "-", parts[3], "_", parts[4])
+  }
 }
 
-make_light_cluster_delta_vs_no_light_mean_plots <- function(light_clusters,
-                                                            n_clusters,
-                                                            cluster_colors) {
-  cluster_order <- names(cluster_colors)
-  cluster_order <- cluster_order[cluster_order %in% unique(light_clusters$mean$ClusterLabel)]
-
-  plots <- lapply(cluster_order, function(cluster_label) {
-    light_d <- light_clusters$mean %>%
-      dplyr::filter(ClusterLabel == cluster_label)
-    no_light_d <- rubi_no_light_mean
-
-    start_time <- max(min(light_d$TimeRubi), min(no_light_d$TimeRubi))
-    end_time <- min(max(light_d$TimeRubi), max(no_light_d$TimeRubi))
-    dt <- median(c(diff(light_d$TimeRubi), diff(no_light_d$TimeRubi)), na.rm = TRUE)
-    if (!is.finite(dt) || dt <= 0 || end_time <= start_time) return(NULL)
-
-    grid <- seq(start_time, end_time, by = dt)
-    delta_d <- make_independent_mean_delta(light_d, no_light_d, grid)
-    delta_d$Delta <- delta_d$Mean
-    delta_d$ClusterLabel <- cluster_label
-
-    n_light <- light_clusters$features %>%
-      dplyr::filter(ClusterLabel == cluster_label) %>%
-      dplyr::pull(Curve) %>%
-      dplyr::n_distinct()
-    n_no_light <- dplyr::n_distinct(rubi_no_light_norm$Curve)
-
-    ggplot(delta_d, aes(TimeRubi, Delta)) +
-      light_band_layer() +
-      geom_hline(yintercept = 0, color = "grey75", linewidth = 0.5) +
-      geom_ribbon(
-        aes(ymin = CI_low, ymax = CI_high),
-        fill = condition_color("rubi_light - rubi_no_light"),
-        alpha = 0.14,
-        color = NA
-      ) +
-      geom_line(color = condition_color("rubi_light - rubi_no_light"),
-                linewidth = 1.35) +
-      labs(
-        title = paste0("Δ підгрупи опроміненого RuBi-Nicotine: ", cluster_label),
-        subtitle = paste0(
-          n_clusters,
-          " підгрупи; n опроміненого = ", n_light,
-          ", n неопроміненого = ", n_no_light,
-          "; Δ = опромінений - неопромінений; CI через поширення SEM незалежних середніх"
-        ),
-        x = "Час від початку відповіді, с",
-        y = "Δ середньої нормованої відповіді"
-      ) +
-      presentation_theme() +
-      axes_from_origin(delta_d, "TimeRubi")
-  })
-  names(plots) <- cluster_label_slug(cluster_order)
-  plots[!vapply(plots, is.null, logical(1))]
-}
-
-rubi_light_cluster_vs_no_light_mean_plots_2 <- make_light_cluster_vs_no_light_mean_plots(
-  rubi_light_clusters_2,
-  n_clusters = 2,
-  cluster_colors = cluster_colors_2
-)
-rubi_light_cluster_vs_no_light_mean_plots_3 <- make_light_cluster_vs_no_light_mean_plots(
-  rubi_light_clusters_3,
-  n_clusters = 3,
-  cluster_colors = cluster_colors_3
-)
-rubi_light_cluster_delta_vs_no_light_mean_plots_2 <- make_light_cluster_delta_vs_no_light_mean_plots(
-  rubi_light_clusters_2,
-  n_clusters = 2,
-  cluster_colors = cluster_colors_2
-)
-rubi_light_cluster_delta_vs_no_light_mean_plots_3 <- make_light_cluster_delta_vs_no_light_mean_plots(
-  rubi_light_clusters_3,
-  n_clusters = 3,
-  cluster_colors = cluster_colors_3
-)
-
-for (p in rubi_light_cluster_vs_no_light_mean_plots_2) print(p)
-for (p in rubi_light_cluster_vs_no_light_mean_plots_3) print(p)
-for (p in rubi_light_cluster_delta_vs_no_light_mean_plots_2) print(p)
-for (p in rubi_light_cluster_delta_vs_no_light_mean_plots_3) print(p)
-
-for (nm in names(rubi_light_cluster_vs_no_light_mean_plots_2)) {
-  save_group_plot(
-    rubi_light_cluster_vs_no_light_mean_plots_2[[nm]],
-    "rubi_comparison/2_subgroups",
-    paste0("rubi_light_subgroup_vs_no_light_mean_2_groups_", nm)
+combined_sources_long_no_light <- dplyr::bind_rows(lapply(names(combined_sources), function(sample_name) {
+  data.frame(
+    Sample = sample_name,
+    RawSource = combined_sources[[sample_name]],
+    SourceFile = vapply(combined_sources[[sample_name]], raw_var_to_source_file, character(1))
   )
-}
-for (nm in names(rubi_light_cluster_vs_no_light_mean_plots_3)) {
-  save_group_plot(
-    rubi_light_cluster_vs_no_light_mean_plots_3[[nm]],
-    "rubi_comparison/3_subgroups",
-    paste0("rubi_light_subgroup_vs_no_light_mean_3_groups_", nm)
+}))
+
+rubi_no_light_region_from_file <- combined_sources_long_no_light %>%
+  dplyr::filter(Sample %in% unique(rubi_no_light_norm$Sample)) %>%
+  dplyr::inner_join(drug_region_by_file, by = "SourceFile") %>%
+  dplyr::group_by(Sample) %>%
+  dplyr::summarise(
+    DrugRegionFromFile = if (dplyr::n_distinct(DrugRegion) == 1) dplyr::first(DrugRegion) else NA_real_,
+    SourceFiles = paste(unique(SourceFile), collapse = ", "),
+    .groups = "drop"
   )
-}
-for (nm in names(rubi_light_cluster_delta_vs_no_light_mean_plots_2)) {
-  save_group_plot(
-    rubi_light_cluster_delta_vs_no_light_mean_plots_2[[nm]],
-    "rubi_comparison/2_subgroups",
-    paste0("rubi_light_subgroup_minus_no_light_mean_delta_2_groups_", nm)
+
+rubi_no_light_region_by_sample <- rubi_no_light_region_from_file %>%
+  dplyr::full_join(drug_region_by_sample, by = "Sample") %>%
+  dplyr::mutate(
+    DrugRegion = dplyr::coalesce(DrugRegion, DrugRegionFromFile)
+  ) %>%
+  dplyr::filter(DrugRegion %in% c(2, 3))
+
+rubi_no_light_region_norm <- rubi_no_light_norm %>%
+  dplyr::inner_join(
+    rubi_no_light_region_by_sample[, c("Sample", "DrugRegion", "SourceFiles")],
+    by = "Sample"
+  ) %>%
+  dplyr::mutate(
+    RegionLabel = paste0("Ділянка ", DrugRegion)
   )
-}
-for (nm in names(rubi_light_cluster_delta_vs_no_light_mean_plots_3)) {
+
+print(rubi_no_light_region_by_sample)
+
+if (nrow(rubi_no_light_region_norm)) {
+  rubi_no_light_region_means <- dplyr::bind_rows(lapply(
+    split(rubi_no_light_region_norm, rubi_no_light_region_norm$RegionLabel),
+    function(d) {
+      m <- make_mean_curve(
+        split(d, d$Curve),
+        time_col = "TimeRubi",
+        value_col = "TraceNormKCl0",
+        target_end_time = rubi_light_duration
+      )
+      m$RegionLabel <- unique(d$RegionLabel)
+      m$DrugRegion <- unique(d$DrugRegion)
+      m
+    }
+  ))
+
+  rubi_no_light_region_counts <- rubi_no_light_region_norm %>%
+    dplyr::distinct(RegionLabel, Curve) %>%
+    dplyr::count(RegionLabel, name = "N")
+
+  region_colors <- c("Ділянка 2" = "#0077B6", "Ділянка 3" = "#E31A1C")
+  rubi_no_light_region_plot_data <- thin_plot_data(
+    rubi_no_light_region_norm,
+    group_col = "Curve",
+    max_points = 4000
+  )
+
+  p_rubi_no_light_region_individual <- ggplot(
+    rubi_no_light_region_plot_data,
+    aes(TimeRubi, TraceNormKCl0, group = Curve, color = RegionLabel)
+  ) +
+    light_band_layer() +
+    geom_line(alpha = 0.8, linewidth = 0.75) +
+    scale_color_manual(values = region_colors, name = NULL) +
+    labs(
+      title = "Неопромінений RuBi-Nicotine: окремі криві за ділянкою препарату",
+      subtitle = paste(
+        paste0(rubi_no_light_region_counts$RegionLabel, ": n = ", rubi_no_light_region_counts$N),
+        collapse = "; "
+      ),
+      x = "Час від початку відповіді, с",
+      y = "Нормована відповідь"
+    ) +
+    presentation_theme() +
+    axes_from_origin(rubi_no_light_region_norm, "TimeRubi")
+
+  p_rubi_no_light_by_region <- ggplot(
+    rubi_no_light_region_plot_data,
+    aes(TimeRubi, TraceNormKCl0, group = Curve, color = RegionLabel)
+  ) +
+    light_band_layer() +
+    geom_line(alpha = 0.35, linewidth = 0.55) +
+    geom_ribbon(
+      data = rubi_no_light_region_means,
+      aes(TimeRubi, ymin = CI_low, ymax = CI_high, fill = RegionLabel),
+      inherit.aes = FALSE,
+      alpha = 0.16,
+      color = NA
+    ) +
+    geom_line(
+      data = rubi_no_light_region_means,
+      aes(TimeRubi, Mean, color = RegionLabel),
+      inherit.aes = FALSE,
+      linewidth = 1.35
+    ) +
+    scale_color_manual(values = region_colors, name = NULL) +
+    scale_fill_manual(values = region_colors, guide = "none") +
+    labs(
+      title = "Неопромінений RuBi-Nicotine за ділянкою препарату",
+      subtitle = paste(
+        paste0(rubi_no_light_region_counts$RegionLabel, ": n = ", rubi_no_light_region_counts$N),
+        collapse = "; "
+      ),
+      x = "Час від початку відповіді, с",
+      y = "Нормована відповідь"
+    ) +
+    presentation_theme() +
+    axes_from_origin(rubi_no_light_region_norm, "TimeRubi")
+
+  show_plot(p_rubi_no_light_region_individual)
+  show_plot(p_rubi_no_light_by_region)
   save_group_plot(
-    rubi_light_cluster_delta_vs_no_light_mean_plots_3[[nm]],
-    "rubi_comparison/3_subgroups",
-    paste0("rubi_light_subgroup_minus_no_light_mean_delta_3_groups_", nm)
+    p_rubi_no_light_region_individual,
+    "rubi_no_light/regions",
+    "rubi_no_light_individual_curves_by_drug_region_2_3"
+  )
+  save_group_plot(
+    p_rubi_no_light_by_region,
+    "rubi_no_light/regions",
+    "rubi_no_light_by_drug_region_2_3"
+  )
+} else {
+  message(
+    "Не знайдено rubi_no_light-кривих із використаних записів, ",
+    "для яких задано ділянку препарату 2 або 3."
   )
 }
 ```
 
+
+### Вимкнений попередній підхід
+
+Кластеризацію за всією формою кривої перенесено до
+`trachea_2025_legacy_whole_curve_clustering.Rmd`; в основному аналізі
+використовується лише експериментально визначене вікно 420-540 с.
+
+```{r disable_whole_curve_clustering, include=FALSE}
+whole_curve_rubi_clusters_enabled <- FALSE
+```
+
+### Попарний аналіз і кластеризація у вікні світла
+
 ```{r paired_rubi_light_vs_no_light_prelight_aligned, fig.width=10, fig.height=6}
+# Попарний режим включає лише випадки, де обидві умови та KCl задані
+# в одному елементі series_list_*. Обидві відповіді діляться на один KCl.
 make_paired_rubi_curve <- function(sample_name, item, condition_key,
-                                   marker_range = c(4.6, 5.6),
+                                   marker_range = default_marker_range,
                                    expected_onset = 300,
                                    max_duration = rubi_light_duration) {
   kcl_d <- extract_clean_window(sample_name, item$kcl, marker_range = marker_range)
@@ -2820,6 +2781,8 @@ align_pair_by_prelight_derivative <- function(pair_data,
   )
 }
 
+# Синхронізація виконується окремо всередині кожної пари за раннім підйомом.
+# Пізню частину кривої та момент опромінення для вирівнювання не використовуємо.
 paired_rubi_parts <- list()
 for (def_i in seq_along(series_defs)) {
   def <- series_defs[[def_i]]
@@ -2957,8 +2920,8 @@ p_paired_rubi_delta <- ggplot(
   presentation_theme() +
   axes_from_origin(paired_rubi_delta, "TimeRubi")
 
-print(p_paired_rubi_curves)
-print(p_paired_rubi_delta)
+show_plot(p_paired_rubi_curves)
+show_plot(p_paired_rubi_delta)
 
 save_group_plot(
   p_paired_rubi_curves,
@@ -2971,6 +2934,248 @@ save_group_plot(
   "paired_rubi_light_minus_no_light_prelight_aligned_delta"
 )
 ```
+
+```{r rubi_window_420_540_cluster_check, fig.width=10, fig.height=6}
+# Це exploratory-кластеризація, а не наперед задані біологічні групи.
+# Для кожної кривої беруться лише характеристики під час світла:
+# середнє, максимум, зміна, нахил і площа під кривою у 420-540 с.
+response_window <- light_window
+
+summarise_response_window <- function(d, time_col = "TimeRubi",
+                                      value_col = "TraceNormKCl0",
+                                      id_col = "Curve",
+                                      window = response_window) {
+  d <- d[is.finite(d[[time_col]]) & is.finite(d[[value_col]]), ]
+  d <- d[order(d[[time_col]]), ]
+  if (nrow(d) < 3 ||
+      max(d[[time_col]], na.rm = TRUE) < window[2] ||
+      min(d[[time_col]], na.rm = TRUE) > window[1]) {
+    return(NULL)
+  }
+
+  start_value <- approx(d[[time_col]], d[[value_col]], xout = window[1],
+                        rule = 1, ties = mean)$y
+  end_value <- approx(d[[time_col]], d[[value_col]], xout = window[2],
+                      rule = 1, ties = mean)$y
+  w <- d[d[[time_col]] >= window[1] & d[[time_col]] <= window[2], ]
+  if (nrow(w) < 3 || !is.finite(start_value) || !is.finite(end_value)) {
+    return(NULL)
+  }
+
+  fit <- stats::lm(w[[value_col]] ~ w[[time_col]])
+  data.frame(
+    Curve = d[[id_col]][1],
+    Sample = if ("Sample" %in% names(d)) d$Sample[1] else d[[id_col]][1],
+    SeriesList = if ("SeriesList" %in% names(d)) d$SeriesList[1] else NA_character_,
+    MeanWindow = mean(w[[value_col]], na.rm = TRUE),
+    MaxWindow = max(w[[value_col]], na.rm = TRUE),
+    StartWindow = start_value,
+    EndWindow = end_value,
+    DeltaWindow = end_value - start_value,
+    SlopeWindow = stats::coef(fit)[2],
+    AUCWindow = trapezoid_auc(w[[time_col]], w[[value_col]]),
+    NPointsWindow = nrow(w)
+  )
+}
+
+cluster_by_response_window <- function(data, condition_key, value_col,
+                                       id_col = "Curve",
+                                       n_clusters = 2,
+                                       window = response_window,
+                                       high_label = "Вища відповідь у 420-540 с",
+                                       low_label = "Нижча відповідь у 420-540 с") {
+  features <- dplyr::bind_rows(lapply(
+    split(data, data[[id_col]]),
+    summarise_response_window,
+    value_col = value_col,
+    id_col = id_col,
+    window = window
+  ))
+
+  if (!nrow(features) || nrow(features) < n_clusters) {
+    message(
+      condition_label(condition_key), ": замало кривих для k-means у вікні ",
+      paste(window, collapse = "-"), " с."
+    )
+    return(list(features = features, data = NULL, mean = NULL))
+  }
+
+  feature_cols <- c(
+    "MeanWindow", "MaxWindow", "DeltaWindow", "SlopeWindow", "AUCWindow"
+  )
+  feature_mat <- as.matrix(features[, feature_cols])
+  for (j in seq_len(ncol(feature_mat))) {
+    feature_mat[!is.finite(feature_mat[, j]), j] <- median(
+      feature_mat[, j], na.rm = TRUE
+    )
+  }
+
+  # Фіксований seed робить результат k-means відтворюваним.
+  set.seed(1)
+  km <- stats::kmeans(scale(feature_mat), centers = n_clusters, nstart = 100)
+  features$ClusterRaw <- km$cluster
+
+  cluster_stats <- features %>%
+    dplyr::group_by(ClusterRaw) %>%
+    dplyr::summarise(
+      MeanWindow = mean(MeanWindow, na.rm = TRUE),
+      MaxWindow = mean(MaxWindow, na.rm = TRUE),
+      DeltaWindow = mean(DeltaWindow, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(dplyr::desc(MeanWindow)) %>%
+    dplyr::mutate(ClusterLabel = c(high_label, low_label)[seq_len(dplyr::n())])
+
+  features <- features %>%
+    dplyr::left_join(cluster_stats[, c("ClusterRaw", "ClusterLabel")],
+                     by = "ClusterRaw")
+
+  clustered <- data %>%
+    dplyr::left_join(features[, c("Curve", "ClusterLabel")], by = "Curve")
+
+  cluster_means <- dplyr::bind_rows(lapply(
+    split(clustered, clustered$ClusterLabel),
+    function(d) {
+      m <- make_mean_curve(
+        split(d, d[[id_col]]),
+        time_col = "TimeRubi",
+        value_col = value_col
+      )
+      m$ClusterLabel <- d$ClusterLabel[1]
+      m$N_curves <- dplyr::n_distinct(d[[id_col]])
+      m
+    }
+  ))
+
+  list(features = features, data = clustered, mean = cluster_means)
+}
+
+plot_window_clusters <- function(cluster_result, title, y_label,
+                                 value_col = "TraceNormKCl0",
+                                 group_dir = "rubi_comparison/window_420_540",
+                                 file_name = NULL) {
+  if (is.null(cluster_result$data) || !nrow(cluster_result$data)) {
+    return(NULL)
+  }
+
+  cluster_colors <- c(
+    "Вища відповідь у 420-540 с" = "#E31A1C",
+    "Нижча відповідь у 420-540 с" = "#0077B6",
+    "Більша Δ у 420-540 с" = "#E31A1C",
+    "Менша Δ у 420-540 с" = "#0077B6"
+  )
+  counts <- cluster_result$features %>%
+    dplyr::count(ClusterLabel, name = "N")
+  plot_data <- thin_plot_data(cluster_result$data, group_col = "Curve")
+
+  p <- ggplot(plot_data, aes(TimeRubi, .data[[value_col]],
+                             group = Curve, color = ClusterLabel)) +
+    light_band_layer() +
+    geom_line(alpha = 0.35, linewidth = 0.55) +
+    geom_ribbon(
+      data = cluster_result$mean,
+      aes(TimeRubi, ymin = CI_low, ymax = CI_high, fill = ClusterLabel),
+      inherit.aes = FALSE,
+      alpha = 0.16,
+      color = NA
+    ) +
+    geom_line(
+      data = cluster_result$mean,
+      aes(TimeRubi, Mean, color = ClusterLabel),
+      inherit.aes = FALSE,
+      linewidth = 1.35
+    ) +
+    scale_color_manual(values = cluster_colors, name = NULL) +
+    scale_fill_manual(values = cluster_colors, guide = "none") +
+    labs(
+      title = title,
+      subtitle = paste(
+        "Кластеризація лише за ознаками у 420-540 с;",
+        paste0(counts$ClusterLabel, ": n = ", counts$N, collapse = "; ")
+      ),
+      x = "Час від початку відповіді, с",
+      y = y_label
+    ) +
+    presentation_theme() +
+    axes_from_origin(cluster_result$data, "TimeRubi")
+
+  show_plot(p)
+  if (!is.null(file_name)) {
+    save_group_plot(p, group_dir, file_name)
+  }
+  p
+}
+
+rubi_light_window_clusters <- cluster_by_response_window(
+  rubi_light_norm,
+  condition_key = "rubi_light",
+  value_col = "TraceNormKCl0"
+)
+rubi_no_light_window_clusters <- cluster_by_response_window(
+  rubi_no_light_norm,
+  condition_key = "rubi_no_light",
+  value_col = "TraceNormKCl0"
+)
+
+paired_delta_for_window <- if (exists("paired_rubi_delta") && nrow(paired_rubi_delta)) {
+  dplyr::rename(paired_rubi_delta, Curve = Pair)
+} else {
+  data.frame()
+}
+paired_delta_window_clusters <- if (nrow(paired_delta_for_window)) {
+  cluster_by_response_window(
+    paired_delta_for_window,
+    condition_key = "rubi_light - rubi_no_light",
+    value_col = "Delta",
+    high_label = "Більша Δ у 420-540 с",
+    low_label = "Менша Δ у 420-540 с"
+  )
+} else {
+  list(features = data.frame(), data = NULL, mean = NULL)
+}
+
+print_window_cluster_features <- function(cluster_result, title) {
+  features <- cluster_result$features
+  if (!nrow(features)) {
+    message(title, ": немає кривих із повним вікном 420-540 с.")
+    return(invisible(NULL))
+  }
+
+  message(title)
+  if ("ClusterLabel" %in% names(features)) {
+    print(features %>% dplyr::arrange(ClusterLabel, dplyr::desc(MeanWindow)))
+  } else {
+    message("Кластеризацію не виконано: замало кривих для заданої кількості груп.")
+    print(features %>% dplyr::arrange(dplyr::desc(MeanWindow)))
+  }
+}
+
+print_window_cluster_features(rubi_light_window_clusters, "Опромінений RuBi-Nicotine")
+print_window_cluster_features(rubi_no_light_window_clusters, "Неопромінений RuBi-Nicotine")
+print_window_cluster_features(paired_delta_window_clusters, "Δ: опромінений - неопромінений RuBi-Nicotine")
+
+p_rubi_light_window_clusters <- plot_window_clusters(
+  rubi_light_window_clusters,
+  title = "Опромінений RuBi-Nicotine: групування за вікном 420-540 с",
+  y_label = "Нормована відповідь",
+  file_name = "rubi_light_clusters_by_420_540_window"
+)
+p_rubi_no_light_window_clusters <- plot_window_clusters(
+  rubi_no_light_window_clusters,
+  title = "Неопромінений RuBi-Nicotine: групування за вікном 420-540 с",
+  y_label = "Нормована відповідь",
+  file_name = "rubi_no_light_clusters_by_420_540_window"
+)
+p_paired_delta_window_clusters <- plot_window_clusters(
+  paired_delta_window_clusters,
+  title = "Δ RuBi-Nicotine: групування за вікном 420-540 с",
+  y_label = "Δ нормованої відповіді",
+  value_col = "Delta",
+  file_name = "paired_delta_clusters_by_420_540_window"
+)
+```
+
+### Основне порівняння середніх
 
 ```{r rubi_light_vs_no_light_mean, fig.width=9, fig.height=5.5}
 rubi_light_mean_onset <- estimate_rise_onset(
@@ -3028,7 +3233,7 @@ p_rubi_light_vs_no_light_mean <- ggplot(rubi_mean_both, aes(TimeRubi, Mean, colo
   presentation_theme() +
   axes_from_origin(rubi_mean_both, "TimeRubi")
 
-print(p_rubi_light_vs_no_light_mean)
+show_plot(p_rubi_light_vs_no_light_mean)
 save_group_plot(
   p_rubi_light_vs_no_light_mean,
   "rubi_comparison/1_no_subgroups",
@@ -3036,7 +3241,259 @@ save_group_plot(
 )
 ```
 
-```{r nic_plots, fig.width=10, fig.height=6}
+## 7. Експериментальні способи оцінки ефекту світла
+
+Ці аналізи доповнюють основне KCl-нормування. Вони перевіряють, наскільки
+висновок залежить від рівня безпосередньо перед світлом і форми кривої.
+Поточний основний експериментальний варіант `y/y420 - 1` виконується після
+підготовки nicotine у розділі 8. Методи нижче залишені як exploratory-контроль.
+
+```{r rubi_light_effect_experimental_norms, fig.width=10, fig.height=6}
+exp_light_window <- light_window
+exp_pre_light_window <- c(390, 420)
+exp_trend_window <- c(300, 420)
+
+prepare_light_effect_curve <- function(d, condition_key,
+                                       time_col = "TimeRubi",
+                                       value_col = "TraceNormKCl0",
+                                       curve_col = "Curve",
+                                       pre_window = exp_pre_light_window,
+                                       light_window = exp_light_window,
+                                       trend_window = exp_trend_window) {
+  parts <- lapply(split(d, d[[curve_col]]), function(x) {
+    x <- x[order(x[[time_col]]), ]
+    time <- x[[time_col]]
+    value <- x[[value_col]]
+
+    pre_idx <- time >= pre_window[1] & time <= pre_window[2]
+    light_idx <- time >= light_window[1] & time <= light_window[2]
+    trend_idx <- time >= trend_window[1] & time <= trend_window[2]
+    if (sum(pre_idx & is.finite(value)) < 3 || sum(light_idx & is.finite(value)) < 3) {
+      return(NULL)
+    }
+
+    pre_level <- mean(value[pre_idx], na.rm = TRUE)
+    y_light_start <- curve_value_at(time, value, light_window[1])
+    max_light <- max(value[light_idx], na.rm = TRUE)
+    delta_max <- max_light - y_light_start
+    auc_from_y420 <- trapezoid_auc(time[light_idx], value[light_idx] - y_light_start)
+    slope_light <- as.numeric(stats::coef(stats::lm(
+      value[light_idx] ~ time[light_idx]
+    ))[2])
+
+    ratio_den <- if (is.finite(pre_level) && abs(pre_level) > 1e-6) pre_level else NA_real_
+    post_max_idx <- time >= light_window[1]
+    post_max <- max(value[post_max_idx], na.rm = TRUE)
+    post_amp <- post_max - y_light_start
+
+    trend_fit <- if (sum(trend_idx & is.finite(value)) >= 10) {
+      trend_data <- data.frame(
+        Time = time[trend_idx],
+        Value = value[trend_idx]
+      )
+      try(stats::lm(Value ~ Time, data = trend_data), silent = TRUE)
+    } else {
+      NULL
+    }
+    predicted_no_light <- if (!is.null(trend_fit) && !inherits(trend_fit, "try-error")) {
+      as.numeric(stats::predict(
+        trend_fit,
+        newdata = data.frame(Time = time),
+        type = "response"
+      ))
+    } else {
+      rep(NA_real_, length(time))
+    }
+
+    x$Condition <- condition_key
+    x$PreLightLevel <- pre_level
+    x$Y420 <- y_light_start
+    x$DeltaMax420_540 <- delta_max
+    x$AUC420_540FromY420 <- auc_from_y420
+    x$Slope420_540 <- slope_light
+    x$RatioToPreLight <- value / ratio_den
+    x$PostLightKinetics <- if (is.finite(post_amp) && post_amp > 0) {
+      (value - y_light_start) / post_amp
+    } else {
+      NA_real_
+    }
+    x$PredictedNoLightTrend <- predicted_no_light
+    x$TrendResidual <- value - predicted_no_light
+    x
+  })
+
+  dplyr::bind_rows(parts)
+}
+
+rubi_light_effect_experimental <- dplyr::bind_rows(
+  prepare_light_effect_curve(rubi_light_norm, "rubi_light"),
+  prepare_light_effect_curve(rubi_no_light_norm, "rubi_no_light")
+)
+
+if (!nrow(rubi_light_effect_experimental)) {
+  stop("Не вдалося сформувати експериментальні варіанти нормування RuBi-Nicotine.")
+}
+
+rubi_light_effect_metrics <- rubi_light_effect_experimental %>%
+  dplyr::distinct(
+    Condition, Curve, Sample, PreLightLevel, Y420,
+    DeltaMax420_540, AUC420_540FromY420, Slope420_540
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(DeltaMax420_540, AUC420_540FromY420, Slope420_540),
+    names_to = "Metric",
+    values_to = "Value"
+  ) %>%
+  dplyr::mutate(
+    Metric = dplyr::recode(
+      Metric,
+      DeltaMax420_540 = "Приріст max - y420",
+      AUC420_540FromY420 = "AUC 420-540 від y420",
+      Slope420_540 = "Нахил 420-540"
+    )
+  )
+
+make_experimental_mean <- function(value_col) {
+  means <- dplyr::bind_rows(lapply(
+    split(rubi_light_effect_experimental, rubi_light_effect_experimental$Condition),
+    function(d) {
+      m <- make_mean_curve(
+        split(d, d$Curve),
+        time_col = "TimeRubi",
+        value_col = value_col,
+        target_end_time = rubi_light_duration
+      )
+      m$Condition <- unique(d$Condition)[1]
+      m
+    }
+  ))
+  means$ValueColumn <- value_col
+  means
+}
+
+rubi_ratio_to_prelight_mean <- make_experimental_mean("RatioToPreLight")
+rubi_postlight_kinetics_mean <- make_experimental_mean("PostLightKinetics")
+rubi_trend_residual_mean <- make_experimental_mean("TrendResidual")
+
+p_rubi_light_effect_metrics <- ggplot(
+  rubi_light_effect_metrics,
+  aes(Condition, Value, color = Condition)
+) +
+  geom_hline(yintercept = 0, color = "grey75", linewidth = 0.45) +
+  geom_jitter(width = 0.12, height = 0, alpha = 0.7, size = 2.2) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.45,
+               linewidth = 0.65, color = "black") +
+  facet_wrap(~Metric, scales = "free_y") +
+  condition_color_scale(breaks = c("rubi_no_light", "rubi_light")) +
+  labs(
+    title = "RuBi-Nicotine: метрики зміни у зоні опромінення",
+    subtitle = paste0("Вікно світла ", exp_light_window[1], "-", exp_light_window[2],
+      " с; точки - окремі криві, чорна риска - середнє"
+    ),
+    x = NULL,
+    y = "Значення метрики"
+  ) +
+  presentation_theme()
+
+p_rubi_ratio_to_prelight <- ggplot(
+  rubi_ratio_to_prelight_mean,
+  aes(TimeRubi, Mean, color = Condition)
+) +
+  light_band_layer() +
+  geom_hline(yintercept = 1, color = "grey75", linewidth = 0.5) +
+  geom_ribbon(aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+              alpha = 0.14, color = NA) +
+  geom_line(linewidth = 1.25) +
+  condition_color_scale(breaks = c("rubi_no_light", "rubi_light")) +
+  condition_fill_scale(breaks = c("rubi_no_light", "rubi_light")) +
+  labs(
+    title = "RuBi-Nicotine: відношення до рівня перед світлом",
+    subtitle = paste0("Кожну криву поділено на середній рівень ",
+                      exp_pre_light_window[1], "-", exp_pre_light_window[2], " с"),
+    x = "Час від початку відповіді, с",
+    y = "Відповідь / рівень перед світлом"
+  ) +
+  presentation_theme() +
+  axes_from_origin(rubi_ratio_to_prelight_mean, "TimeRubi")
+
+p_rubi_postlight_kinetics <- ggplot(
+  rubi_postlight_kinetics_mean,
+  aes(TimeRubi, Mean, color = Condition)
+) +
+  light_band_layer() +
+  geom_hline(yintercept = 0, color = "grey75", linewidth = 0.5) +
+  geom_ribbon(aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+              alpha = 0.14, color = NA) +
+  geom_line(linewidth = 1.25) +
+  condition_color_scale(breaks = c("rubi_no_light", "rubi_light")) +
+  condition_fill_scale(breaks = c("rubi_no_light", "rubi_light")) +
+  labs(
+    title = "RuBi-Nicotine: кінетика після початку світла",
+    subtitle = "Кожну криву нормовано як (y - y420) / (max після 420 с - y420)",
+    x = "Час від початку відповіді, с",
+    y = "Пост-світлова нормована кінетика"
+  ) +
+  presentation_theme() +
+  axes_from_origin(rubi_postlight_kinetics_mean, "TimeRubi")
+
+p_rubi_trend_residual <- ggplot(
+  rubi_trend_residual_mean,
+  aes(TimeRubi, Mean, color = Condition)
+) +
+  light_band_layer() +
+  geom_hline(yintercept = 0, color = "grey75", linewidth = 0.5) +
+  geom_ribbon(aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+              alpha = 0.14, color = NA) +
+  geom_line(linewidth = 1.25) +
+  condition_color_scale(breaks = c("rubi_no_light", "rubi_light")) +
+  condition_fill_scale(breaks = c("rubi_no_light", "rubi_light")) +
+  labs(
+    title = "RuBi-Nicotine: залишок від pre-light тренду",
+    subtitle = paste0(
+      "Лінійний прогноз без світла побудовано по ",
+      exp_trend_window[1], "-", exp_trend_window[2], " с"
+    ),
+    x = "Час від початку відповіді, с",
+    y = "Відхилення від прогнозу без світла"
+  ) +
+  presentation_theme() +
+  axes_from_origin(rubi_trend_residual_mean, "TimeRubi")
+
+show_plot(p_rubi_light_effect_metrics)
+show_plot(p_rubi_ratio_to_prelight)
+show_plot(p_rubi_postlight_kinetics)
+show_plot(p_rubi_trend_residual)
+
+save_group_plot(
+  p_rubi_light_effect_metrics,
+  "rubi_comparison/1_no_subgroups/experimental_light_effect",
+  "01_light_window_metrics"
+)
+save_group_plot(
+  p_rubi_ratio_to_prelight,
+  "rubi_comparison/1_no_subgroups/experimental_light_effect",
+  "02_ratio_to_prelight_level"
+)
+save_group_plot(
+  p_rubi_postlight_kinetics,
+  "rubi_comparison/1_no_subgroups/experimental_light_effect",
+  "03_postlight_kinetics_y420_to_max"
+)
+save_group_plot(
+  p_rubi_trend_residual,
+  "rubi_comparison/1_no_subgroups/experimental_light_effect",
+  "04_residual_from_prelight_trend"
+)
+```
+
+## 8. Nicotine та порівняння з ефектом світла
+
+### Підготовка та усереднення nicotine
+
+```{r nicotine_preprocessing, fig.width=10, fig.height=6}
+# nic, nic_1 і nic_2 позначають повторні nicotine-відповіді в різних записах.
+# Кожну криву нормуємо на KCl того самого препарату, після чого
+# синхронізуємо початок підйому за похідною та обчислюємо спільне середнє.
 nic_keys <- c("nic", "nic_1", "nic_2")
 exclude_nic <- c(
   # Виключено як зашумлений запис із малою амплітудою відповіді.
@@ -3057,9 +3514,15 @@ if (!length(nic_results)) stop("Не знайдено валідних nic-кр�
 nic_norm <- dplyr::bind_rows(lapply(nic_results, `[[`, "data"))
 nic_norm$Condition <- "nic"
 
-nic_alignment_result <- align_curves_by_derivative(
+nic_alignment_result <- align_curves_by_rise_onset(
   nic_norm,
-  expected_onset = expected_response_onset("nic")
+  expected_onset = expected_response_onset("nic"),
+  max_shift = 80,
+  baseline_window = c(-80, -20),
+  search_window = c(-40, 180),
+  smooth_seconds = 8,
+  amplitude_fraction = 0.075,
+  sustain_seconds = 6
 )
 nic_norm <- nic_alignment_result$data
 nic_alignment_summary <- nic_alignment_result$summary
@@ -3104,6 +3567,13 @@ nic_mean_at_light_band <- nic_mean %>%
     CI_high,
     Condition = "nic mean"
   )
+```
+
+### Службові функції для порівняння nicotine з Δ RuBi-Nicotine
+
+```{r nicotine_delta_helpers, fig.width=10, fig.height=6}
+# На цих графіках початок підйому nicotine суміщається з початком
+# опромінення (420 с) у Δ-кривій. Саму Δ-криву додатково не зсуваємо.
 
 add_nicotine_to_delta_plot <- function(plot, delta_data, delta_time_col = "TimeRubi") {
   nic_plot_data <- nic_mean_at_light_band %>%
@@ -3183,6 +3653,400 @@ make_delta_nic_kinetics_plot <- function(delta_nic_data, title, subtitle = NULL)
 
   list(data = kinetics_data, plot = p)
 }
+```
+
+### Додаткові exploratory-способи оцінки ефекту світла
+
+```{r nicotine_legacy_experimental_comparisons, fig.width=10, fig.height=6}
+# Цей блок залишено для відтворюваності попередніх перевірок.
+# Основний експериментальний варіант нижче використовує y/y420 - 1.
+
+nic_for_experimental_light_effect <- nic_norm
+nic_for_experimental_light_effect$TimeRubi <-
+  nic_for_experimental_light_effect$TimeFromOnset -
+  nic_rise_onset_for_light_band + exp_light_window[1]
+nic_light_effect_experimental <- prepare_light_effect_curve(
+  nic_for_experimental_light_effect,
+  "nic mean"
+)
+
+make_nic_experimental_mean <- function(value_col) {
+  m <- make_mean_curve(
+    split(nic_light_effect_experimental, nic_light_effect_experimental$Curve),
+    time_col = "TimeRubi",
+    value_col = value_col,
+    target_end_time = rubi_light_duration,
+    end_mode = "longest"
+  )
+  m$Condition <- "nic mean"
+  m
+}
+
+nic_ratio_to_prelight_mean <- make_nic_experimental_mean("RatioToPreLight")
+nic_ratio_to_prelight_mean <- nic_ratio_to_prelight_mean %>%
+  dplyr::mutate(
+    Mean = Mean - 1,
+    CI_low = CI_low - 1,
+    CI_high = CI_high - 1
+  )
+nic_postlight_kinetics_mean <- make_nic_experimental_mean("PostLightKinetics")
+nic_trend_residual_mean <- make_nic_experimental_mean("TrendResidual")
+
+make_experimental_delta_curve <- function(mean_data, nic_data,
+                                          method_label,
+                                          y_label,
+                                          title_suffix) {
+  light_d <- mean_data %>% dplyr::filter(Condition == "rubi_light")
+  no_light_d <- mean_data %>% dplyr::filter(Condition == "rubi_no_light")
+  start_time <- max(min(light_d$TimeRubi), min(no_light_d$TimeRubi))
+  end_time <- min(max(light_d$TimeRubi), max(no_light_d$TimeRubi))
+  dt <- median(c(diff(light_d$TimeRubi), diff(no_light_d$TimeRubi)), na.rm = TRUE)
+  if (!is.finite(dt) || dt <= 0 || end_time <= start_time) return(NULL)
+
+  grid <- seq(start_time, end_time, by = dt)
+  delta_d <- make_independent_mean_delta(light_d, no_light_d, grid)
+  nic_d <- nic_data %>%
+    dplyr::filter(TimeRubi >= start_time, TimeRubi <= end_time) %>%
+    dplyr::select(TimeRubi, Mean, CI_low, CI_high, N, Condition)
+
+  comparison_d <- dplyr::bind_rows(delta_d, nic_d) %>%
+    dplyr::mutate(Method = method_label)
+
+  p <- ggplot(comparison_d, aes(TimeRubi, Mean, color = Condition)) +
+    light_band_layer() +
+    geom_hline(yintercept = 0, color = "grey75", linewidth = 0.45) +
+    geom_vline(xintercept = exp_light_window[1], linetype = "dashed", color = "grey45") +
+    geom_ribbon(
+      aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+      alpha = 0.13,
+      color = NA
+    ) +
+    geom_line(linewidth = 1.25) +
+    condition_color_scale(breaks = c("nic mean", "rubi_light - rubi_no_light")) +
+    condition_fill_scale(breaks = c("nic mean", "rubi_light - rubi_no_light")) +
+    labs(
+      title = paste0("Nicotine і Δ RuBi-Nicotine: ", title_suffix),
+      subtitle = paste0("Nicotine: підйом на ", exp_light_window[1],
+                        " с; Δ = опромінений - неопромінений"),
+      x = "Час від початку відповіді, с",
+      y = y_label
+    ) +
+    presentation_theme() +
+    axes_from_origin(comparison_d, "TimeRubi")
+
+  list(data = comparison_d, plot = p)
+}
+
+summarise_metric_ci <- function(d) {
+  d %>%
+    dplyr::group_by(Condition, Metric) %>%
+    dplyr::summarise(
+      Mean = mean(Value, na.rm = TRUE),
+      SD = stats::sd(Value, na.rm = TRUE),
+      N = sum(is.finite(Value)),
+      SEM = SD / sqrt(N),
+      CI_low = Mean - stats::qt(0.975, pmax(N - 1, 1)) * SEM,
+      CI_high = Mean + stats::qt(0.975, pmax(N - 1, 1)) * SEM,
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      CI_low = ifelse(N < 2, NA_real_, CI_low),
+      CI_high = ifelse(N < 2, NA_real_, CI_high)
+    )
+}
+
+nic_light_effect_metrics <- nic_light_effect_experimental %>%
+  dplyr::distinct(
+    Condition, Curve, Sample, PreLightLevel, Y420,
+    DeltaMax420_540, AUC420_540FromY420, Slope420_540
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(DeltaMax420_540, AUC420_540FromY420, Slope420_540),
+    names_to = "Metric",
+    values_to = "Value"
+  ) %>%
+  dplyr::mutate(
+    Metric = dplyr::recode(
+      Metric,
+      DeltaMax420_540 = "Приріст max - y420",
+      AUC420_540FromY420 = "AUC 420-540 від y420",
+      Slope420_540 = "Нахил 420-540"
+    )
+  )
+
+rubi_metric_summary <- summarise_metric_ci(rubi_light_effect_metrics)
+nic_metric_summary <- summarise_metric_ci(nic_light_effect_metrics)
+experimental_delta_metric_summary <- rubi_metric_summary %>%
+  dplyr::select(Condition, Metric, Mean, SEM, N) %>%
+  tidyr::pivot_wider(
+    names_from = Condition,
+    values_from = c(Mean, SEM, N)
+  ) %>%
+  dplyr::transmute(
+    Condition = "rubi_light - rubi_no_light",
+    Metric,
+    Mean = Mean_rubi_light - Mean_rubi_no_light,
+    SEM = sqrt(SEM_rubi_light^2 + SEM_rubi_no_light^2),
+    N_light = N_rubi_light,
+    N_no_light = N_rubi_no_light,
+    CI_low = Mean - stats::qt(
+      0.975,
+      pmin(pmax(N_light - 1, 1), pmax(N_no_light - 1, 1))
+    ) * SEM,
+    CI_high = Mean + stats::qt(
+      0.975,
+      pmin(pmax(N_light - 1, 1), pmax(N_no_light - 1, 1))
+    ) * SEM
+  )
+
+experimental_delta_nic_metrics <- dplyr::bind_rows(
+  experimental_delta_metric_summary,
+  nic_metric_summary %>%
+    dplyr::select(Condition, Metric, Mean, SEM, N, CI_low, CI_high)
+) %>%
+  dplyr::mutate(Method = "Метрики у зоні 420-540 с")
+
+p_experimental_delta_nic_metrics <- ggplot(
+  experimental_delta_nic_metrics,
+  aes(Condition, Mean, color = Condition)
+) +
+  geom_hline(yintercept = 0, color = "grey75", linewidth = 0.45) +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 0.14, linewidth = 0.75) +
+  geom_point(size = 3.2) +
+  facet_wrap(~Metric, scales = "free_y") +
+  condition_color_scale(breaks = c("nic mean", "rubi_light - rubi_no_light")) +
+  ggplot2::scale_x_discrete(
+    labels = c(
+      "nic mean" = "Nicotine",
+      "rubi_light - rubi_no_light" = "Δ RuBi"
+    )
+  ) +
+  labs(
+    title = "Nicotine і Δ RuBi-Nicotine: метрики у зоні опромінення",
+    subtitle = paste0(
+      "Вікно ", exp_light_window[1], "-", exp_light_window[2],
+      " с; точки - середні, вертикальні лінії - 95% CI"
+    ),
+    x = NULL,
+    y = "Значення метрики"
+  ) +
+  presentation_theme()
+
+experimental_ratio_delta_nic <- make_experimental_delta_curve(
+  rubi_ratio_to_prelight_mean,
+  nic_ratio_to_prelight_mean,
+  method_label = "Відносно pre-light рівня",
+  y_label = "Δ відношення / nicotine приріст від pre-light",
+  title_suffix = "відносно pre-light рівня; чутливо до рівня біля 0"
+)
+experimental_postlight_delta_nic <- make_experimental_delta_curve(
+  rubi_postlight_kinetics_mean,
+  nic_postlight_kinetics_mean,
+  method_label = "Кінетика від y420 до max",
+  y_label = "Нормована пост-світлова кінетика",
+  title_suffix = "кінетика від y420 до max"
+)
+experimental_trend_residual_delta_nic <- make_experimental_delta_curve(
+  rubi_trend_residual_mean,
+  nic_trend_residual_mean,
+  method_label = "Залишок від pre-light тренду",
+  y_label = "Відхилення від прогнозу pre-light тренду",
+  title_suffix = "залишок від pre-light тренду"
+)
+
+p_experimental_ratio_delta_nic <- experimental_ratio_delta_nic$plot
+p_experimental_postlight_delta_nic <- experimental_postlight_delta_nic$plot
+p_experimental_trend_residual_delta_nic <- experimental_trend_residual_delta_nic$plot
+experimental_ratio_delta_nic_data <- experimental_ratio_delta_nic$data
+experimental_postlight_delta_nic_data <- experimental_postlight_delta_nic$data
+experimental_trend_residual_delta_nic_data <- experimental_trend_residual_delta_nic$data
+```
+
+### Основний експериментальний варіант: нормування на y420
+
+```{r nicotine_y420_comparison, fig.width=10, fig.height=6}
+# Для кожної окремої RuBi-кривої: y_norm(t) = y(t) / y(420) - 1.
+# Тому обидві групи дорівнюють нулю в 420 с, а Δ є різницею вже
+# нормованих групових середніх і не нормується повторно.
+
+make_y420_scaled_mean <- function(d, condition_key,
+                                  value_col = "TraceNormKCl0",
+                                  y420_min_abs = 0.05) {
+  scaled_d <- d %>%
+    dplyr::group_by(Curve) %>%
+    dplyr::mutate(
+      Y420Scale = curve_value_at(TimeRubi, .data[[value_col]], exp_light_window[1]),
+      TraceY420Relative = ifelse(
+        is.finite(Y420Scale) & abs(Y420Scale) >= y420_min_abs,
+        .data[[value_col]] / Y420Scale - 1,
+        NA_real_
+      )
+    ) %>%
+    dplyr::ungroup()
+  scaled_d$Condition <- condition_key
+  valid_curves <- scaled_d %>%
+    dplyr::distinct(Curve, Y420Scale) %>%
+    dplyr::filter(is.finite(Y420Scale), abs(Y420Scale) >= y420_min_abs) %>%
+    dplyr::pull(Curve)
+  if (!length(valid_curves)) {
+    stop("Немає кривих із придатним y420 для ", condition_key, ".")
+  }
+  mean_d <- dplyr::filter(scaled_d, Curve %in% valid_curves)
+
+  m <- make_mean_curve(
+    split(mean_d, mean_d$Curve),
+    time_col = "TimeRubi",
+    value_col = "TraceY420Relative",
+    target_end_time = rubi_light_duration
+  )
+  m$Condition <- condition_key
+
+  list(data = scaled_d, mean = m, valid_curves = valid_curves)
+}
+
+rubi_light_y420_scaled <- make_y420_scaled_mean(rubi_light_norm, "rubi_light")
+rubi_no_light_y420_source <- if (exists("rubi_no_light_norm_all")) {
+  rubi_no_light_norm_all
+} else {
+  rubi_no_light_norm
+}
+rubi_no_light_y420_scaled <- make_y420_scaled_mean(
+  rubi_no_light_y420_source,
+  "rubi_no_light"
+)
+rubi_y420_scaled_mean <- dplyr::bind_rows(
+  rubi_light_y420_scaled$mean,
+  rubi_no_light_y420_scaled$mean
+)
+rubi_y420_scaled_individual <- dplyr::bind_rows(
+  rubi_light_y420_scaled$data,
+  rubi_no_light_y420_scaled$data
+) %>%
+  dplyr::filter(is.finite(TraceY420Relative)) %>%
+  dplyr::mutate(PlotCurve = interaction(Condition, Curve, drop = TRUE))
+rubi_y420_scaled_individual_plot_data <- thin_plot_data(
+  rubi_y420_scaled_individual,
+  group_col = "PlotCurve",
+  max_points = 3000
+)
+rubi_y420_individual_n <- rubi_y420_scaled_individual %>%
+  dplyr::distinct(Condition, Curve) %>%
+  dplyr::count(Condition, name = "N")
+
+y420_start <- max(
+  min(rubi_light_y420_scaled$mean$TimeRubi),
+  min(rubi_no_light_y420_scaled$mean$TimeRubi)
+)
+y420_end <- min(
+  max(rubi_light_y420_scaled$mean$TimeRubi),
+  max(rubi_no_light_y420_scaled$mean$TimeRubi)
+)
+y420_dt <- median(c(
+  diff(rubi_light_y420_scaled$mean$TimeRubi),
+  diff(rubi_no_light_y420_scaled$mean$TimeRubi)
+), na.rm = TRUE)
+y420_grid <- seq(y420_start, y420_end, by = y420_dt)
+rubi_y420_scaled_difference <- make_independent_mean_delta(
+  rubi_light_y420_scaled$mean,
+  rubi_no_light_y420_scaled$mean,
+  y420_grid
+)
+
+rubi_y420_scaled_delta_nic_data <- make_delta_nic_data(
+  rubi_y420_scaled_difference
+)
+
+p_rubi_y420_scaled_individual <- ggplot(
+  rubi_y420_scaled_individual_plot_data,
+  aes(TimeRubi, TraceY420Relative, group = PlotCurve, color = Condition)
+) +
+  light_band_layer() +
+  geom_hline(yintercept = 0, color = "grey75", linewidth = 0.45) +
+  geom_vline(xintercept = exp_light_window[1], linetype = "dashed", color = "grey45") +
+  geom_line(alpha = 0.38, linewidth = 0.55) +
+  geom_line(
+    data = rubi_y420_scaled_mean,
+    aes(TimeRubi, Mean),
+    inherit.aes = FALSE,
+    color = "black",
+    linewidth = 1.25
+  ) +
+  facet_wrap(
+    ~Condition,
+    ncol = 1,
+    labeller = ggplot2::as_labeller(condition_labels)
+  ) +
+  condition_color_scale(breaks = c("rubi_no_light", "rubi_light")) +
+  labs(
+    title = "Окремі RuBi-Nicotine криві після нормування на y420",
+    subtitle = paste0(
+      "Режим 1: усі активні записи, включно з попередньо виключеними ",
+      "rubi_no_light; тонкі лінії - окремі, чорна - середня; ",
+      paste(
+        condition_label(rubi_y420_individual_n$Condition),
+        "n =", rubi_y420_individual_n$N,
+        collapse = "; "
+      )
+    ),
+    x = "Час від початку відповіді, с",
+    y = "Відносна зміна від y420",
+    color = NULL
+  ) +
+  presentation_theme() +
+  theme(legend.position = "none") +
+  axes_from_origin(rubi_y420_scaled_individual, "TimeRubi")
+
+p_rubi_y420_scaled_mean <- ggplot(
+  rubi_y420_scaled_mean,
+  aes(TimeRubi, Mean, color = Condition)
+) +
+  light_band_layer() +
+  geom_hline(yintercept = 0, color = "grey75", linewidth = 0.45) +
+  geom_vline(xintercept = exp_light_window[1], linetype = "dashed", color = "grey45") +
+  geom_ribbon(aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+              alpha = 0.13, color = NA) +
+  geom_line(linewidth = 1.25) +
+  condition_color_scale(breaks = c("rubi_no_light", "rubi_light")) +
+  condition_fill_scale(breaks = c("rubi_no_light", "rubi_light")) +
+  labs(
+    title = "RuBi-Nicotine: нормування на y420",
+    subtitle = "Режим 1: усі активні записи; показано y/y420 - 1; у 420 с обидві групи мають 0",
+    x = "Час від початку відповіді, с",
+    y = "Відносна зміна від y420"
+  ) +
+  presentation_theme() +
+  axes_from_origin(rubi_y420_scaled_mean, "TimeRubi")
+
+p_rubi_y420_scaled_delta_vs_nic <- ggplot(
+  rubi_y420_scaled_delta_nic_data,
+  aes(TimeRubi, Mean, color = Condition)
+) +
+  light_band_layer() +
+  geom_hline(yintercept = 0, color = "grey75", linewidth = 0.45) +
+  geom_vline(xintercept = exp_light_window[1], linetype = "dashed", color = "grey45") +
+  geom_ribbon(aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+              alpha = 0.13, color = NA) +
+  geom_line(linewidth = 1.25) +
+  condition_color_scale(breaks = c("nic mean", "rubi_light - rubi_no_light")) +
+  condition_fill_scale(breaks = c("nic mean", "rubi_light - rubi_no_light")) +
+  labs(
+    title = "Nicotine і Δ y420-нормованих RuBi-кривих",
+    subtitle = paste0(
+      "Режим 1: усі активні записи; RuBi normalized = y/y420 - 1; ",
+      "Δ = опромінений normalized - неопромінений normalized"
+    ),
+    x = "Час від початку відповіді, с",
+    y = "Δ відносної зміни RuBi / відповідь nicotine"
+  ) +
+  presentation_theme() +
+  axes_from_origin(rubi_y420_scaled_delta_nic_data, "TimeRubi")
+```
+
+### Основні графіки nicotine та Δ RuBi-Nicotine
+
+```{r nicotine_main_comparisons, fig.width=10, fig.height=6}
+# Нижче зберігається базове порівняння середніх, незалежне від
+# експериментального y420-нормування.
 
 print(nic_curve_summary)
 print(nic_alignment_summary)
@@ -3336,6 +4200,13 @@ p_rubi_mean_delta_only <- add_nicotine_to_delta_plot(
   p_rubi_mean_delta_only,
   rubi_difference
 )
+```
+
+### Порівняння nicotine з підгрупами RuBi-Nicotine
+
+```{r nicotine_cluster_comparisons, fig.width=10, fig.height=6}
+# Підгрупи визначені лише за характеристиками в зоні опромінення
+# 420-540 с; функції формують для кожної підгрупи Δ та її кінетику.
 
 if (!exists("cluster_label_slug")) {
   cluster_label_slug <- function(x) {
@@ -3458,7 +4329,8 @@ make_light_cluster_delta_nic_kinetics_plots <- function(light_clusters,
   plots[!vapply(plots, is.null, logical(1))]
 }
 
-if (exists("rubi_light_clusters_2") && exists("rubi_light_clusters_3") &&
+if (isTRUE(whole_curve_rubi_clusters_enabled) &&
+    exists("rubi_light_clusters_2") && exists("rubi_light_clusters_3") &&
     exists("cluster_colors_2") && exists("cluster_colors_3")) {
   rubi_light_cluster_delta_with_nic_plots_2 <- make_light_cluster_delta_with_nic_plots(
     rubi_light_clusters_2,
@@ -3568,25 +4440,36 @@ nic_vs_rubi_kinetics_result <- make_delta_nic_kinetics_plot(
 nic_vs_rubi_kinetics <- nic_vs_rubi_kinetics_result$data
 p_nic_vs_rubi_kinetics <- nic_vs_rubi_kinetics_result$plot
 
-print(p_nic_records)
-print(p_rubi_light_no_light_difference)
-print(p_rubi_mean_delta_only)
-if (exists("p_paired_rubi_delta_with_nic")) print(p_paired_rubi_delta_with_nic)
-if (exists("p_paired_rubi_delta_nic_kinetics")) print(p_paired_rubi_delta_nic_kinetics)
-if (exists("rubi_light_cluster_delta_with_nic_plots_2")) {
-  for (p in rubi_light_cluster_delta_with_nic_plots_2) print(p)
+show_plot(p_nic_records)
+show_plot(p_rubi_light_no_light_difference)
+show_plot(p_rubi_mean_delta_only)
+if (exists("p_paired_rubi_delta_with_nic")) show_plot(p_paired_rubi_delta_with_nic)
+if (exists("p_paired_rubi_delta_nic_kinetics")) show_plot(p_paired_rubi_delta_nic_kinetics)
+if (isTRUE(whole_curve_rubi_clusters_enabled) &&
+    exists("rubi_light_cluster_delta_with_nic_plots_2")) {
+  for (p in rubi_light_cluster_delta_with_nic_plots_2) show_plot(p)
 }
-if (exists("rubi_light_cluster_delta_with_nic_plots_3")) {
-  for (p in rubi_light_cluster_delta_with_nic_plots_3) print(p)
+if (isTRUE(whole_curve_rubi_clusters_enabled) &&
+    exists("rubi_light_cluster_delta_with_nic_plots_3")) {
+  for (p in rubi_light_cluster_delta_with_nic_plots_3) show_plot(p)
 }
-if (exists("rubi_light_cluster_delta_nic_kinetics_plots_2")) {
-  for (p in rubi_light_cluster_delta_nic_kinetics_plots_2) print(p)
+if (isTRUE(whole_curve_rubi_clusters_enabled) &&
+    exists("rubi_light_cluster_delta_nic_kinetics_plots_2")) {
+  for (p in rubi_light_cluster_delta_nic_kinetics_plots_2) show_plot(p)
 }
-if (exists("rubi_light_cluster_delta_nic_kinetics_plots_3")) {
-  for (p in rubi_light_cluster_delta_nic_kinetics_plots_3) print(p)
+if (isTRUE(whole_curve_rubi_clusters_enabled) &&
+    exists("rubi_light_cluster_delta_nic_kinetics_plots_3")) {
+  for (p in rubi_light_cluster_delta_nic_kinetics_plots_3) show_plot(p)
 }
-print(p_nic_vs_rubi_difference)
-print(p_nic_vs_rubi_kinetics)
+show_plot(p_nic_vs_rubi_difference)
+show_plot(p_nic_vs_rubi_kinetics)
+show_plot(p_experimental_delta_nic_metrics)
+show_plot(p_experimental_ratio_delta_nic)
+show_plot(p_experimental_postlight_delta_nic)
+show_plot(p_experimental_trend_residual_delta_nic)
+show_plot(p_rubi_y420_scaled_individual)
+show_plot(p_rubi_y420_scaled_mean)
+show_plot(p_rubi_y420_scaled_delta_vs_nic)
 save_group_plot(p_nic_records, "nic", "nic_individual_curves_and_mean")
 save_group_plot(
   p_rubi_light_no_light_difference,
@@ -3612,7 +4495,8 @@ if (exists("p_paired_rubi_delta_nic_kinetics")) {
     "paired_rubi_light_minus_no_light_delta_with_nic_kinetics"
   )
 }
-if (exists("rubi_light_cluster_delta_with_nic_plots_2")) {
+if (isTRUE(whole_curve_rubi_clusters_enabled) &&
+    exists("rubi_light_cluster_delta_with_nic_plots_2")) {
   for (nm in names(rubi_light_cluster_delta_with_nic_plots_2)) {
     save_group_plot(
       rubi_light_cluster_delta_with_nic_plots_2[[nm]],
@@ -3621,7 +4505,8 @@ if (exists("rubi_light_cluster_delta_with_nic_plots_2")) {
     )
   }
 }
-if (exists("rubi_light_cluster_delta_with_nic_plots_3")) {
+if (isTRUE(whole_curve_rubi_clusters_enabled) &&
+    exists("rubi_light_cluster_delta_with_nic_plots_3")) {
   for (nm in names(rubi_light_cluster_delta_with_nic_plots_3)) {
     save_group_plot(
       rubi_light_cluster_delta_with_nic_plots_3[[nm]],
@@ -3630,7 +4515,8 @@ if (exists("rubi_light_cluster_delta_with_nic_plots_3")) {
     )
   }
 }
-if (exists("rubi_light_cluster_delta_nic_kinetics_plots_2")) {
+if (isTRUE(whole_curve_rubi_clusters_enabled) &&
+    exists("rubi_light_cluster_delta_nic_kinetics_plots_2")) {
   for (nm in names(rubi_light_cluster_delta_nic_kinetics_plots_2)) {
     save_group_plot(
       rubi_light_cluster_delta_nic_kinetics_plots_2[[nm]],
@@ -3639,7 +4525,8 @@ if (exists("rubi_light_cluster_delta_nic_kinetics_plots_2")) {
     )
   }
 }
-if (exists("rubi_light_cluster_delta_nic_kinetics_plots_3")) {
+if (isTRUE(whole_curve_rubi_clusters_enabled) &&
+    exists("rubi_light_cluster_delta_nic_kinetics_plots_3")) {
   for (nm in names(rubi_light_cluster_delta_nic_kinetics_plots_3)) {
     save_group_plot(
       rubi_light_cluster_delta_nic_kinetics_plots_3[[nm]],
@@ -3668,21 +4555,598 @@ save_group_plot(
   "rubi_comparison/1_no_subgroups",
   "mean_delta_with_nicotine_rise_at_420_kinetics"
 )
+save_group_plot(
+  p_experimental_delta_nic_metrics,
+  "rubi_comparison/1_no_subgroups/experimental_light_effect/nicotine_comparison",
+  "05_metrics_delta_vs_nicotine"
+)
+if (!is.null(p_experimental_ratio_delta_nic)) {
+  save_group_plot(
+    p_experimental_ratio_delta_nic,
+    "rubi_comparison/1_no_subgroups/experimental_light_effect/nicotine_comparison",
+    "06_ratio_delta_vs_nicotine"
+  )
+}
+if (!is.null(p_experimental_postlight_delta_nic)) {
+  save_group_plot(
+    p_experimental_postlight_delta_nic,
+    "rubi_comparison/1_no_subgroups/experimental_light_effect/nicotine_comparison",
+    "07_postlight_kinetics_delta_vs_nicotine"
+  )
+}
+if (!is.null(p_experimental_trend_residual_delta_nic)) {
+  save_group_plot(
+    p_experimental_trend_residual_delta_nic,
+    "rubi_comparison/1_no_subgroups/experimental_light_effect/nicotine_comparison",
+    "08_trend_residual_delta_vs_nicotine"
+  )
+}
+save_group_plot(
+  p_rubi_y420_scaled_individual,
+  "rubi_comparison/1_no_subgroups/experimental_light_effect/nicotine_comparison",
+  "09a_y420_scaled_individual_rubi_curves",
+  width = 12,
+  height = 10
+)
+save_group_plot(
+  p_rubi_y420_scaled_mean,
+  "rubi_comparison/1_no_subgroups/experimental_light_effect/nicotine_comparison",
+  "09_y420_scaled_rubi_light_and_no_light",
+  width = 12
+)
+save_group_plot(
+  p_rubi_y420_scaled_delta_vs_nic,
+  "rubi_comparison/1_no_subgroups/experimental_light_effect/nicotine_comparison",
+  "10_y420_scaled_delta_vs_nicotine",
+  width = 12
+)
+# Офіційний режим 1: усі активні записи з придатним y420.
+save_group_plot(
+  p_rubi_y420_scaled_individual,
+  "rubi_comparison/experimental_y420/1_all",
+  "01_individual_curves",
+  width = 12,
+  height = 10
+)
+save_group_plot(
+  p_rubi_y420_scaled_mean,
+  "rubi_comparison/experimental_y420/1_all",
+  "02_group_means",
+  width = 12
+)
+save_group_plot(
+  p_rubi_y420_scaled_delta_vs_nic,
+  "rubi_comparison/experimental_y420/1_all",
+  "03_delta_vs_nicotine",
+  width = 12
+)
 ```
 
-```{r selected_groups_norm_by_kcl, fig.width=10, fig.height=6}
-if (!exists("marker_range")) marker_range <- c(4.6, 5.6)
-if (!exists("rmd_path") || is.null(rmd_path) || !file.exists(rmd_path)) {
-  rmd_path <- if (requireNamespace("knitr", quietly = TRUE)) knitr::current_input() else NULL
-  if (is.null(rmd_path) || !file.exists(rmd_path)) {
-    rmd_path <- "trachea_2025_import_combine.Rmd"
-  }
+### Експериментальна пара з одного запису
+
+```{r same_list_rubi_pair_experimental, fig.width=11, fig.height=6}
+# Окремий експеримент: лише записи, де rubi_light і rubi_no_light
+# задані в одному елементі series_list разом зі спільним KCl.
+same_list_rubi_pair <- paired_rubi_aligned
+same_list_rubi_delta <- paired_rubi_delta
+same_list_pair_names <- sort(unique(same_list_rubi_pair$Pair))
+
+if (!nrow(same_list_rubi_pair) || !nrow(same_list_rubi_delta)) {
+  stop("Не знайдено пари rubi_light/rubi_no_light в одному елементі series_list.")
 }
+
+same_list_pair_subtitle <- paste0(
+  "Запис: ", paste(same_list_pair_names, collapse = ", "),
+  "; n = ", length(same_list_pair_names),
+  " пара; обидві криві нормовано на амплітуду спільного KCl"
+)
+
+p_same_list_rubi_pair <- ggplot(
+  same_list_rubi_pair,
+  aes(TimeRubi, TraceNormKCl0, color = Condition,
+      group = interaction(Pair, Condition))
+) +
+  light_band_layer() +
+  geom_hline(yintercept = 0, color = "grey75", linewidth = 0.45) +
+  geom_line(linewidth = 1.2) +
+  condition_color_scale(breaks = c("rubi_no_light", "rubi_light")) +
+  labs(
+    title = "RuBi-Nicotine з одного запису",
+    subtitle = same_list_pair_subtitle,
+    x = "Час від початку відповіді, с",
+    y = "Нормована відповідь"
+  ) +
+  presentation_theme() +
+  axes_from_origin(same_list_rubi_pair, "TimeRubi")
+
+p_same_list_rubi_delta <- ggplot(
+  same_list_rubi_delta,
+  aes(TimeRubi, Delta, group = Pair)
+) +
+  light_band_layer() +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.5) +
+  geom_line(
+    color = condition_color("rubi_light - rubi_no_light"),
+    linewidth = 1.3
+  ) +
+  labs(
+    title = "Попарна Δ RuBi-Nicotine з одного запису",
+    subtitle = paste0(
+      "Запис: ", paste(same_list_pair_names, collapse = ", "),
+      "; Δ = опромінений - неопромінений; для однієї пари CI не розраховується"
+    ),
+    x = "Час від початку відповіді, с",
+    y = "Δ нормованої відповіді"
+  ) +
+  presentation_theme() +
+  axes_from_origin(same_list_rubi_delta, "TimeRubi")
+
+same_list_delta_vs_nicotine <- make_delta_nic_data(
+  data.frame(
+    TimeRubi = same_list_rubi_delta$TimeRubi,
+    Mean = same_list_rubi_delta$Delta
+  )
+)
+
+p_same_list_delta_vs_nicotine <- ggplot(
+  same_list_delta_vs_nicotine,
+  aes(TimeRubi, Mean, color = Condition)
+) +
+  light_band_layer() +
+  geom_hline(yintercept = 0, color = "grey75", linewidth = 0.45) +
+  geom_vline(xintercept = 420, linetype = "dashed", color = "grey45") +
+  geom_ribbon(
+    data = dplyr::filter(
+      same_list_delta_vs_nicotine,
+      Condition == "nic mean", is.finite(CI_low), is.finite(CI_high)
+    ),
+    aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+    alpha = 0.13,
+    color = NA
+  ) +
+  geom_line(linewidth = 1.25) +
+  condition_color_scale(breaks = c("nic mean", "rubi_light - rubi_no_light")) +
+  condition_fill_scale(breaks = "nic mean") +
+  labs(
+    title = "Nicotine і попарна Δ RuBi-Nicotine",
+    subtitle = paste0(
+      "RuBi-Nicotine: ", paste(same_list_pair_names, collapse = ", "),
+      "; початок підйому nicotine вирівняно до 420 с"
+    ),
+    x = "Час від початку відповіді, с",
+    y = "Нормована відповідь"
+  ) +
+  presentation_theme() +
+  axes_from_origin(same_list_delta_vs_nicotine, "TimeRubi")
+
+# Експериментальне нормування кожної кривої в парі на її власне y420.
+same_list_rubi_pair_y420 <- same_list_rubi_pair %>%
+  dplyr::group_by(Pair, Condition) %>%
+  dplyr::mutate(
+    Y420Scale = curve_value_at(TimeRubi, TraceNormKCl0, exp_light_window[1]),
+    TraceY420Relative = ifelse(
+      is.finite(Y420Scale) & abs(Y420Scale) >= 0.05,
+      TraceNormKCl0 / Y420Scale - 1,
+      NA_real_
+    )
+  ) %>%
+  dplyr::ungroup()
+
+valid_y420_pairs <- same_list_rubi_pair_y420 %>%
+  dplyr::distinct(Pair, Condition, Y420Scale) %>%
+  dplyr::filter(is.finite(Y420Scale), abs(Y420Scale) >= 0.05) %>%
+  dplyr::count(Pair, name = "NConditions") %>%
+  dplyr::filter(NConditions == 2) %>%
+  dplyr::pull(Pair)
+
+same_list_rubi_pair_y420 <- same_list_rubi_pair_y420 %>%
+  dplyr::filter(Pair %in% valid_y420_pairs, is.finite(TraceY420Relative))
+
+if (!nrow(same_list_rubi_pair_y420)) {
+  stop("Для спільних rubi_light/rubi_no_light пар немає придатного y420 для обох кривих.")
+}
+
+make_same_list_y420_delta <- function(d) {
+  light_d <- dplyr::filter(d, Condition == "rubi_light")
+  no_light_d <- dplyr::filter(d, Condition == "rubi_no_light")
+  start_time <- max(min(light_d$TimeRubi), min(no_light_d$TimeRubi))
+  end_time <- min(max(light_d$TimeRubi), max(no_light_d$TimeRubi))
+  dt <- median(c(diff(light_d$TimeRubi), diff(no_light_d$TimeRubi)), na.rm = TRUE)
+  grid <- seq(start_time, end_time, by = dt)
+
+  data.frame(
+    Pair = d$Pair[1],
+    TimeRubi = grid,
+    Delta = approx(
+      light_d$TimeRubi, light_d$TraceY420Relative,
+      xout = grid, rule = 1, ties = mean
+    )$y - approx(
+      no_light_d$TimeRubi, no_light_d$TraceY420Relative,
+      xout = grid, rule = 1, ties = mean
+    )$y
+  )
+}
+
+same_list_rubi_delta_y420 <- dplyr::bind_rows(lapply(
+  split(same_list_rubi_pair_y420, same_list_rubi_pair_y420$Pair),
+  make_same_list_y420_delta
+))
+same_list_rubi_delta_y420_mean <- make_mean_curve(
+  split(same_list_rubi_delta_y420, same_list_rubi_delta_y420$Pair),
+  time_col = "TimeRubi",
+  value_col = "Delta"
+)
+same_list_delta_y420_vs_nicotine <- make_delta_nic_data(
+  same_list_rubi_delta_y420_mean
+)
+
+p_same_list_rubi_pair_y420 <- ggplot(
+  same_list_rubi_pair_y420,
+  aes(TimeRubi, TraceY420Relative, color = Condition,
+      group = interaction(Pair, Condition))
+) +
+  light_band_layer() +
+  geom_hline(yintercept = 0, color = "grey75", linewidth = 0.45) +
+  geom_vline(xintercept = 420, linetype = "dashed", color = "grey45") +
+  geom_line(linewidth = 1.2) +
+  condition_color_scale(breaks = c("rubi_no_light", "rubi_light")) +
+  labs(
+    title = "RuBi-Nicotine з одного запису: нормування на y420",
+    subtitle = paste0(
+      "Запис: ", paste(valid_y420_pairs, collapse = ", "),
+      "; для кожної кривої показано y/y420 - 1"
+    ),
+    x = "Час від початку відповіді, с",
+    y = "Відносна зміна від y420"
+  ) +
+  presentation_theme() +
+  axes_from_origin(same_list_rubi_pair_y420, "TimeRubi")
+
+p_same_list_rubi_delta_y420 <- ggplot(
+  same_list_rubi_delta_y420,
+  aes(TimeRubi, Delta, group = Pair)
+) +
+  light_band_layer() +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.5) +
+  geom_vline(xintercept = 420, linetype = "dashed", color = "grey45") +
+  geom_line(
+    color = condition_color("rubi_light - rubi_no_light"),
+    linewidth = 1.3
+  ) +
+  labs(
+    title = "Попарна Δ y420-нормованих RuBi-кривих",
+    subtitle = paste0(
+      "Δ = (опромінений y/y420 - 1) - (неопромінений y/y420 - 1); n = ",
+      length(valid_y420_pairs), "; для однієї пари CI не розраховується"
+    ),
+    x = "Час від початку відповіді, с",
+    y = "Δ відносної зміни від y420"
+  ) +
+  presentation_theme() +
+  axes_from_origin(same_list_rubi_delta_y420, "TimeRubi")
+
+p_same_list_delta_y420_vs_nicotine <- ggplot(
+  same_list_delta_y420_vs_nicotine,
+  aes(TimeRubi, Mean, color = Condition)
+) +
+  light_band_layer() +
+  geom_hline(yintercept = 0, color = "grey75", linewidth = 0.45) +
+  geom_vline(xintercept = 420, linetype = "dashed", color = "grey45") +
+  geom_ribbon(
+    data = dplyr::filter(
+      same_list_delta_y420_vs_nicotine,
+      Condition == "nic mean", is.finite(CI_low), is.finite(CI_high)
+    ),
+    aes(ymin = CI_low, ymax = CI_high, fill = Condition),
+    alpha = 0.13,
+    color = NA
+  ) +
+  geom_line(linewidth = 1.25) +
+  condition_color_scale(breaks = c("nic mean", "rubi_light - rubi_no_light")) +
+  condition_fill_scale(breaks = "nic mean") +
+  labs(
+    title = "Nicotine і попарна Δ y420-нормованих RuBi-кривих",
+    subtitle = paste0(
+      "RuBi-Nicotine: ", paste(valid_y420_pairs, collapse = ", "),
+      "; Δ не нормувалась повторно; підйом nicotine вирівняно до 420 с"
+    ),
+    x = "Час від початку відповіді, с",
+    y = "Δ відносної зміни RuBi / відповідь nicotine"
+  ) +
+  presentation_theme() +
+  axes_from_origin(same_list_delta_y420_vs_nicotine, "TimeRubi")
+
+# Ці графіки виводяться окремо, навіть коли масовий inline-вивід вимкнено.
+print(p_same_list_rubi_pair)
+print(p_same_list_rubi_delta)
+print(p_same_list_delta_vs_nicotine)
+print(p_same_list_rubi_pair_y420)
+print(p_same_list_rubi_delta_y420)
+print(p_same_list_delta_y420_vs_nicotine)
+
+save_group_plot(
+  p_same_list_rubi_pair,
+  "rubi_comparison/same_list_pair_experimental",
+  "01_same_record_rubi_light_and_no_light"
+)
+save_group_plot(
+  p_same_list_rubi_delta,
+  "rubi_comparison/same_list_pair_experimental",
+  "02_same_record_paired_delta"
+)
+save_group_plot(
+  p_same_list_delta_vs_nicotine,
+  "rubi_comparison/same_list_pair_experimental",
+  "03_same_record_paired_delta_vs_nicotine"
+)
+save_group_plot(
+  p_same_list_rubi_pair_y420,
+  "rubi_comparison/same_list_pair_experimental",
+  "04_same_record_y420_scaled_light_and_no_light"
+)
+save_group_plot(
+  p_same_list_rubi_delta_y420,
+  "rubi_comparison/same_list_pair_experimental",
+  "05_same_record_y420_scaled_paired_delta"
+)
+save_group_plot(
+  p_same_list_delta_y420_vs_nicotine,
+  "rubi_comparison/same_list_pair_experimental",
+  "06_same_record_y420_scaled_delta_vs_nicotine"
+)
+# Офіційний режим 2: лише справжні пари з одного запису.
+save_group_plot(
+  p_same_list_rubi_pair_y420,
+  "rubi_comparison/experimental_y420/2_paired",
+  "01_individual_curves"
+)
+save_group_plot(
+  p_same_list_rubi_delta_y420,
+  "rubi_comparison/experimental_y420/2_paired",
+  "02_paired_delta"
+)
+save_group_plot(
+  p_same_list_delta_y420_vs_nicotine,
+  "rubi_comparison/experimental_y420/2_paired",
+  "03_delta_vs_nicotine"
+)
+```
+
+### Exploratory-відбір кривих із горбом у 420-540 с
+
+```{r rubi_y420_clear_hump_experimental, fig.width=11, fig.height=6}
+# Офіційний режим 3 (exploratory): опромінені записи з виразним горбом
+# у зоні світла. Неопромінені контролі не відбираємо за формою кривої.
+summarise_light_hump <- function(d, light_window = c(420, 540),
+                                 end_window = c(525, 540),
+                                 smooth_seconds = 8,
+                                 min_rise = 0.10,
+                                 min_drop = 0.05,
+                                 min_drop_fraction = 0.15) {
+  d <- d[is.finite(d$TimeRubi) & is.finite(d$TraceY420Relative), ]
+  d <- d[order(d$TimeRubi), ]
+  if (nrow(d) < 15) return(NULL)
+
+  dt <- median(diff(d$TimeRubi), na.rm = TRUE)
+  if (!is.finite(dt) || dt <= 0) dt <- 1
+  k <- max(3, as.integer(round(smooth_seconds / dt)))
+  if (k %% 2 == 0) k <- k + 1
+  max_k <- if (nrow(d) %% 2 == 1) nrow(d) else nrow(d) - 1
+  k <- min(k, max_k)
+  smooth_y <- stats::runmed(d$TraceY420Relative, k = k, endrule = "median")
+
+  in_light <- d$TimeRubi >= light_window[1] & d$TimeRubi <= light_window[2]
+  at_end <- d$TimeRubi >= end_window[1] & d$TimeRubi <= end_window[2]
+  pre_light <- d$TimeRubi >= light_window[1] - 60 & d$TimeRubi < light_window[1]
+  if (sum(in_light) < 5 || sum(at_end) < 3) return(NULL)
+
+  light_idx <- which(in_light)
+  peak_idx <- light_idx[which.max(smooth_y[light_idx])]
+  y_start <- curve_value_at(d$TimeRubi, smooth_y, light_window[1])
+  y_end <- median(smooth_y[at_end], na.rm = TRUE)
+  peak_value <- smooth_y[peak_idx]
+  rise <- peak_value - y_start
+  drop <- peak_value - y_end
+  noise <- stats::mad(
+    d$TraceY420Relative[pre_light] - smooth_y[pre_light],
+    constant = 1.4826,
+    na.rm = TRUE
+  )
+  if (!is.finite(noise)) noise <- 0
+
+  rise_threshold <- max(min_rise, 4 * noise)
+  drop_threshold <- max(min_drop, 3 * noise, min_drop_fraction * rise)
+  interior_peak <- d$TimeRubi[peak_idx] >= light_window[1] + 5 &
+    d$TimeRubi[peak_idx] <= light_window[2] - 5
+
+  data.frame(
+    Curve = d$Curve[1],
+    Sample = d$Sample[1],
+    SeriesList = d$SeriesList[1],
+    PeakTime = d$TimeRubi[peak_idx],
+    PeakFromY420 = rise,
+    DropBy540 = drop,
+    NoiseMAD = noise,
+    RiseThreshold = rise_threshold,
+    DropThreshold = drop_threshold,
+    ClearHump = interior_peak & rise >= rise_threshold & drop >= drop_threshold
+  )
+}
+
+rubi_light_hump_features <- dplyr::bind_rows(lapply(
+  split(rubi_light_y420_scaled$data, rubi_light_y420_scaled$data$Curve),
+  summarise_light_hump
+)) %>%
+  dplyr::arrange(dplyr::desc(ClearHump), dplyr::desc(DropBy540))
+print(rubi_light_hump_features)
+
+rubi_light_clear_hump_curves <- rubi_light_hump_features %>%
+  dplyr::filter(ClearHump) %>%
+  dplyr::pull(Curve)
+
+if (!length(rubi_light_clear_hump_curves)) {
+  warning("Не знайдено rubi_light-кривих, які відповідають критеріям виразного горба 420-540 с.")
+} else {
+  rubi_light_clear_hump_y420 <- rubi_light_y420_scaled$data %>%
+    dplyr::filter(
+      Curve %in% rubi_light_clear_hump_curves,
+      is.finite(TraceY420Relative)
+    )
+  rubi_light_clear_hump_y420_mean <- make_mean_curve(
+    split(rubi_light_clear_hump_y420, rubi_light_clear_hump_y420$Curve),
+    time_col = "TimeRubi",
+    value_col = "TraceY420Relative",
+    target_end_time = rubi_light_duration
+  )
+  rubi_light_clear_hump_y420_mean$Condition <- "rubi_light"
+
+  rubi_clear_hump_y420_means <- dplyr::bind_rows(
+    rubi_light_clear_hump_y420_mean,
+    rubi_no_light_y420_scaled$mean
+  )
+  hump_start <- max(
+    min(rubi_light_clear_hump_y420_mean$TimeRubi),
+    min(rubi_no_light_y420_scaled$mean$TimeRubi)
+  )
+  hump_end <- min(
+    max(rubi_light_clear_hump_y420_mean$TimeRubi),
+    max(rubi_no_light_y420_scaled$mean$TimeRubi)
+  )
+  hump_dt <- median(c(
+    diff(rubi_light_clear_hump_y420_mean$TimeRubi),
+    diff(rubi_no_light_y420_scaled$mean$TimeRubi)
+  ), na.rm = TRUE)
+  hump_grid <- seq(hump_start, hump_end, by = hump_dt)
+  rubi_clear_hump_y420_difference <- make_independent_mean_delta(
+    rubi_light_clear_hump_y420_mean,
+    rubi_no_light_y420_scaled$mean,
+    hump_grid
+  )
+  rubi_clear_hump_y420_delta_nic_data <- make_delta_nic_data(
+    rubi_clear_hump_y420_difference
+  )
+
+  rubi_light_clear_hump_plot_data <- thin_plot_data(
+    rubi_light_clear_hump_y420,
+    group_col = "Curve",
+    max_points = 3000
+  )
+  n_hump <- length(rubi_light_clear_hump_curves)
+  n_control <- dplyr::n_distinct(rubi_no_light_y420_scaled$data$Curve)
+
+  p_rubi_clear_hump_individual <- ggplot(
+    rubi_light_clear_hump_plot_data,
+    aes(TimeRubi, TraceY420Relative, group = Curve)
+  ) +
+    light_band_layer() +
+    geom_hline(yintercept = 0, color = "grey75", linewidth = 0.45) +
+    geom_vline(xintercept = 420, linetype = "dashed", color = "grey45") +
+    geom_line(
+      color = condition_color("rubi_light"),
+      alpha = 0.42,
+      linewidth = 0.6
+    ) +
+    geom_line(
+      data = rubi_light_clear_hump_y420_mean,
+      aes(TimeRubi, Mean),
+      inherit.aes = FALSE,
+      color = "black",
+      linewidth = 1.3
+    ) +
+    labs(
+      title = "Опромінений RuBi-Nicotine: записи з горбом у 420-540 с",
+      subtitle = paste0(
+        "n = ", n_hump,
+        "; горб: внутрішній максимум, приріст >= max(0.10; 4xMAD), ",
+        "спад до 540 с >= max(0.05; 3xMAD; 15% приросту)"
+      ),
+      x = "Час від початку відповіді, с",
+      y = "Відносна зміна від y420"
+    ) +
+    presentation_theme() +
+    axes_from_origin(rubi_light_clear_hump_y420, "TimeRubi")
+
+  p_rubi_clear_hump_means <- ggplot(
+    rubi_clear_hump_y420_means,
+    aes(TimeRubi, Mean, color = Condition, fill = Condition)
+  ) +
+    light_band_layer() +
+    geom_hline(yintercept = 0, color = "grey75", linewidth = 0.45) +
+    geom_vline(xintercept = 420, linetype = "dashed", color = "grey45") +
+    geom_ribbon(aes(ymin = CI_low, ymax = CI_high), alpha = 0.13, color = NA) +
+    geom_line(linewidth = 1.25) +
+    condition_color_scale(breaks = c("rubi_no_light", "rubi_light")) +
+    condition_fill_scale(breaks = c("rubi_no_light", "rubi_light")) +
+    labs(
+      title = "RuBi-Nicotine: підгрупа з горбом і повний контроль",
+      subtitle = paste0(
+        "Опромінені з горбом: n = ", n_hump,
+        "; усі придатні неопромінені: n = ", n_control,
+        "; exploratory відбір за результатом"
+      ),
+      x = "Час від початку відповіді, с",
+      y = "Відносна зміна від y420",
+      color = NULL,
+      fill = NULL
+    ) +
+    presentation_theme() +
+    axes_from_origin(rubi_clear_hump_y420_means, "TimeRubi")
+
+  p_rubi_clear_hump_delta_vs_nic <- ggplot(
+    rubi_clear_hump_y420_delta_nic_data,
+    aes(TimeRubi, Mean, color = Condition, fill = Condition)
+  ) +
+    light_band_layer() +
+    geom_hline(yintercept = 0, color = "grey75", linewidth = 0.45) +
+    geom_vline(xintercept = 420, linetype = "dashed", color = "grey45") +
+    geom_ribbon(aes(ymin = CI_low, ymax = CI_high), alpha = 0.13, color = NA) +
+    geom_line(linewidth = 1.25) +
+    condition_color_scale(breaks = c("nic mean", "rubi_light - rubi_no_light")) +
+    condition_fill_scale(breaks = c("nic mean", "rubi_light - rubi_no_light")) +
+    labs(
+      title = "Nicotine і Δ для опромінених кривих з горбом",
+      subtitle = paste0(
+        "Δ: опромінені з горбом (n = ", n_hump,
+        ") - усі неопромінені (n = ", n_control,
+        "); exploratory відбір за результатом"
+      ),
+      x = "Час від початку відповіді, с",
+      y = "Δ відносної зміни RuBi / відповідь nicotine",
+      color = NULL,
+      fill = NULL
+    ) +
+    presentation_theme() +
+    axes_from_origin(rubi_clear_hump_y420_delta_nic_data, "TimeRubi")
+
+  show_plot(p_rubi_clear_hump_individual)
+  show_plot(p_rubi_clear_hump_means)
+  show_plot(p_rubi_clear_hump_delta_vs_nic)
+
+  save_group_plot(
+    p_rubi_clear_hump_individual,
+    "rubi_comparison/experimental_y420/3_clear_hump",
+    "01_individual_curves"
+  )
+  save_group_plot(
+    p_rubi_clear_hump_means,
+    "rubi_comparison/experimental_y420/3_clear_hump",
+    "02_group_means"
+  )
+  save_group_plot(
+    p_rubi_clear_hump_delta_vs_nic,
+    "rubi_comparison/experimental_y420/3_clear_hump",
+    "03_delta_vs_nicotine"
+  )
+}
+```
+
+## 9. Фармакологічні групи
+
+```{r selected_groups_norm_by_kcl, fig.width=10, fig.height=6}
 if (!exists("rubi_light_mean")) {
   stop("Спочатку виконайте chunk rubi_light_norm_by_kcl, щоб був об'єкт rubi_light_mean.")
 }
 
-series_defs <- collect_series_lists_from_rmd(rmd_path)
 condition_keys <- c("caps", "amg", "cgrp", "l703606", "cgrp_l703606")
 condition_exclude <- list()
 condition_results <- list()
@@ -3766,8 +5230,8 @@ for (condition_key in condition_keys) {
     presentation_theme() +
     axes_from_origin(mean_compare_plot, "TimeRubi")
 
-  print(p_curves)
-  print(p_mean_compare)
+  show_plot(p_curves)
+  show_plot(p_mean_compare)
   save_group_plot(
     p_curves, condition_key,
     paste0(condition_key, "_individual_curves_and_mean")
@@ -3806,7 +5270,7 @@ p_all_means_without_no_light <- ggplot(all_means_plot,
   presentation_theme() +
   axes_from_origin(all_means_plot, "TimeRubi")
 
-print(p_all_means_without_no_light)
+show_plot(p_all_means_without_no_light)
 save_group_plot(
   p_all_means_without_no_light,
   "all_groups",
@@ -3814,7 +5278,11 @@ save_group_plot(
 )
 ```
 
+### Glutathione та H2O2
+
 ```{r glutathione_and_h2o2_plots, fig.width=10, fig.height=6}
+# Для цих коротких відповідей автоматичне вирівнювання вимкнено навмисно:
+# часовий нуль визначається заданим вікном, а не похідною кривої.
 glutathione_result <- normalize_condition_by_kcl(
   series_defs = series_defs,
   condition_key = "glutathione",
@@ -4020,11 +5488,11 @@ p_rubi_no_light_vs_h2o2_kinetics <- ggplot(
     rubi_no_vs_h2o2_kinetics_display, "TimeFromOnset", x_max = 700
   )
 
-print(p_glutathione_records)
-print(p_glutathione_vs_rubi_no_light)
-print(p_h2o2_conditions)
-print(p_rubi_no_light_vs_h2o2)
-print(p_rubi_no_light_vs_h2o2_kinetics)
+show_plot(p_glutathione_records)
+show_plot(p_glutathione_vs_rubi_no_light)
+show_plot(p_h2o2_conditions)
+show_plot(p_rubi_no_light_vs_h2o2)
+show_plot(p_rubi_no_light_vs_h2o2_kinetics)
 save_group_plot(
   p_glutathione_records,
   "glutathione",
@@ -4052,10 +5520,188 @@ save_group_plot(
 )
 ```
 
+## 10. Експорт результатів
 
+```{r export_mean_curves_to_data}
+# Експорт не перераховує дані: він записує вже створені вище об'єкти *_mean
+# та таблиці порівнянь у таку саму структуру підпапок, як і рисунки.
+mean_curve_export_root <- "./data/mean_curves/2025"
 
+save_mean_curve_csv <- function(data, group, filename,
+                                root = mean_curve_export_root) {
+  if (is.null(data) || !is.data.frame(data) || !nrow(data)) {
+    return(NULL)
+  }
 
+  output_dir <- file.path(root, group)
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  if (!grepl("\\.csv$", filename, ignore.case = TRUE)) {
+    filename <- paste0(filename, ".csv")
+  }
 
+  path <- file.path(output_dir, filename)
+  utils::write.csv(data, path, row.names = FALSE)
+  data.frame(Group = group, File = path, Rows = nrow(data))
+}
 
+save_mean_curve_object <- function(object_name, group, filename = object_name,
+                                   envir = .GlobalEnv) {
+  if (!exists(object_name, envir = envir)) return(NULL)
+  save_mean_curve_csv(get(object_name, envir = envir), group, filename)
+}
+
+mean_curve_exports <- list()
+add_mean_export <- function(x) {
+  if (!is.null(x)) mean_curve_exports[[length(mean_curve_exports) + 1]] <<- x
+}
+
+# Окремі основні середні криві.
+simple_mean_exports <- list(
+  list("rubi_light_mean", "rubi_light", "rubi_light_mean"),
+  list("rubi_no_light_mean", "rubi_no_light", "rubi_no_light_mean"),
+  list("nic_mean", "nic", "nic_mean"),
+  list("glutathione_mean", "glutathione", "glutathione_mean"),
+  list("h2o2_1000_mean", "h2o2", "h2o2_1000_mean"),
+  list("glutathione_h2o2_100_mean", "h2o2", "glutathione_h2o2_100_mean"),
+  list("glutathione_h2o2_1000_mean", "h2o2", "glutathione_h2o2_1000_mean"),
+  list("caps_mean", "caps", "caps_mean"),
+  list("amg_mean", "amg", "amg_mean"),
+  list("cgrp_mean", "cgrp", "cgrp_mean"),
+  list("l703606_mean", "l703606", "l703606_mean"),
+  list("cgrp_l703606_mean", "cgrp_l703606", "cgrp_l703606_mean")
+)
+
+for (cfg in simple_mean_exports) {
+  add_mean_export(save_mean_curve_object(cfg[[1]], cfg[[2]], cfg[[3]]))
+}
+
+# Середні криві, які використовуються у комбінованих графіках.
+combined_mean_exports <- list(
+  list("rubi_mean_both", "rubi_comparison/1_no_subgroups", "rubi_light_and_no_light_mean"),
+  list("rubi_difference", "rubi_comparison/1_no_subgroups", "rubi_light_minus_no_light_mean_delta"),
+  list("rubi_light_effect_metrics", "rubi_comparison/1_no_subgroups/experimental_light_effect", "light_window_metrics"),
+  list("rubi_ratio_to_prelight_mean", "rubi_comparison/1_no_subgroups/experimental_light_effect", "ratio_to_prelight_mean"),
+  list("rubi_postlight_kinetics_mean", "rubi_comparison/1_no_subgroups/experimental_light_effect", "postlight_kinetics_mean"),
+  list("rubi_trend_residual_mean", "rubi_comparison/1_no_subgroups/experimental_light_effect", "trend_residual_mean"),
+  list("experimental_delta_nic_metrics", "rubi_comparison/1_no_subgroups/experimental_light_effect/nicotine_comparison", "metrics_delta_vs_nicotine"),
+  list("experimental_ratio_delta_nic_data", "rubi_comparison/1_no_subgroups/experimental_light_effect/nicotine_comparison", "ratio_delta_vs_nicotine"),
+  list("experimental_postlight_delta_nic_data", "rubi_comparison/1_no_subgroups/experimental_light_effect/nicotine_comparison", "postlight_kinetics_delta_vs_nicotine"),
+  list("experimental_trend_residual_delta_nic_data", "rubi_comparison/1_no_subgroups/experimental_light_effect/nicotine_comparison", "trend_residual_delta_vs_nicotine"),
+  list("rubi_y420_scaled_mean", "rubi_comparison/1_no_subgroups/experimental_light_effect/nicotine_comparison", "y420_scaled_rubi_light_and_no_light"),
+  list("rubi_y420_scaled_difference", "rubi_comparison/1_no_subgroups/experimental_light_effect/nicotine_comparison", "y420_scaled_delta"),
+  list("rubi_y420_scaled_delta_nic_data", "rubi_comparison/1_no_subgroups/experimental_light_effect/nicotine_comparison", "y420_scaled_delta_vs_nicotine"),
+  list("same_list_rubi_pair_y420", "rubi_comparison/same_list_pair_experimental", "same_record_y420_scaled_light_and_no_light"),
+  list("same_list_rubi_delta_y420_mean", "rubi_comparison/same_list_pair_experimental", "same_record_y420_scaled_paired_delta"),
+  list("same_list_delta_y420_vs_nicotine", "rubi_comparison/same_list_pair_experimental", "same_record_y420_scaled_delta_vs_nicotine"),
+  list("rubi_light_hump_features", "rubi_comparison/experimental_y420/3_clear_hump", "light_hump_selection_metrics"),
+  list("rubi_clear_hump_y420_means", "rubi_comparison/experimental_y420/3_clear_hump", "group_means"),
+  list("rubi_clear_hump_y420_difference", "rubi_comparison/experimental_y420/3_clear_hump", "mean_delta"),
+  list("rubi_clear_hump_y420_delta_nic_data", "rubi_comparison/experimental_y420/3_clear_hump", "delta_vs_nicotine"),
+  list("paired_rubi_delta_mean", "rubi_comparison/1_no_subgroups", "paired_rubi_light_minus_no_light_delta_mean"),
+  list("nic_vs_rubi_difference", "rubi_comparison/1_no_subgroups", "nic_and_rubi_delta_mean"),
+  list("nic_vs_rubi_kinetics", "rubi_comparison/1_no_subgroups", "nic_and_rubi_delta_kinetics"),
+  list("all_means_without_no_light", "all_groups", "all_mean_curves"),
+  list("all_means_plot", "all_groups", "all_mean_curves_cropped_to_shortest"),
+  list("glutathione_vs_rubi_no_light", "glutathione", "glutathione_vs_rubi_no_light_mean"),
+  list("h2o2_means", "h2o2", "all_h2o2_mean_curves"),
+  list("rubi_no_vs_h2o2", "h2o2", "rubi_no_light_glutathione_and_h2o2_mean"),
+  list("rubi_no_vs_h2o2_display", "h2o2", "rubi_no_light_glutathione_and_h2o2_display_mean"),
+  list("rubi_no_vs_h2o2_kinetics", "h2o2", "rubi_no_light_vs_h2o2_1000_kinetics"),
+  list("rubi_no_vs_h2o2_kinetics_display", "h2o2", "rubi_no_light_vs_h2o2_1000_kinetics_display")
+)
+
+for (cfg in combined_mean_exports) {
+  add_mean_export(save_mean_curve_object(cfg[[1]], cfg[[2]], cfg[[3]]))
+}
+
+# Середні по ділянках препарату.
+add_mean_export(save_mean_curve_object(
+  "rubi_light_region_means",
+  "rubi_light/regions",
+  "rubi_light_by_drug_region_mean"
+))
+add_mean_export(save_mean_curve_object(
+  "rubi_no_light_region_means",
+  "rubi_no_light/regions",
+  "rubi_no_light_by_drug_region_mean"
+))
+
+# Середні по кластеризації у зоні опромінення 420-540 с.
+if (exists("rubi_light_window_clusters") &&
+    !is.null(rubi_light_window_clusters$mean)) {
+  add_mean_export(save_mean_curve_csv(
+    rubi_light_window_clusters$mean,
+    "rubi_comparison/window_420_540",
+    "rubi_light_clusters_by_420_540_window_mean"
+  ))
+}
+if (exists("rubi_no_light_window_clusters") &&
+    !is.null(rubi_no_light_window_clusters$mean)) {
+  add_mean_export(save_mean_curve_csv(
+    rubi_no_light_window_clusters$mean,
+    "rubi_comparison/window_420_540",
+    "rubi_no_light_clusters_by_420_540_window_mean"
+  ))
+}
+if (exists("paired_delta_window_clusters") &&
+    !is.null(paired_delta_window_clusters$mean)) {
+  add_mean_export(save_mean_curve_csv(
+    paired_delta_window_clusters$mean,
+    "rubi_comparison/window_420_540",
+    "paired_delta_clusters_by_420_540_window_mean"
+  ))
+}
+
+mean_curve_export_summary <- dplyr::bind_rows(mean_curve_exports)
+print(mean_curve_export_summary)
+```
+
+### Необов'язковий перегляд ключових графіків
+
+```{r show_key_comparison_plots}
+# Якщо потрібно швидко переглянути тільки основні порівняння після повного прогону,
+# змініть render_key_plots_at_end на TRUE у helper_functions.
+if (isTRUE(render_key_plots_at_end)) {
+  key_plot_names <- c(
+    "p_rubi_light_vs_no_light_mean",
+    "p_rubi_light_effect_metrics",
+    "p_rubi_ratio_to_prelight",
+    "p_rubi_postlight_kinetics",
+    "p_rubi_trend_residual",
+    "p_experimental_delta_nic_metrics",
+    "p_experimental_ratio_delta_nic",
+    "p_experimental_postlight_delta_nic",
+    "p_experimental_trend_residual_delta_nic",
+    "p_rubi_y420_scaled_individual",
+    "p_rubi_y420_scaled_mean",
+    "p_rubi_y420_scaled_delta_vs_nic",
+    "p_same_list_rubi_pair_y420",
+    "p_same_list_rubi_delta_y420",
+    "p_same_list_delta_y420_vs_nicotine",
+    "p_rubi_clear_hump_individual",
+    "p_rubi_clear_hump_means",
+    "p_rubi_clear_hump_delta_vs_nic",
+    "p_rubi_light_no_light_difference",
+    "p_rubi_mean_delta_only",
+    "p_paired_rubi_curves",
+    "p_paired_rubi_delta",
+    "p_paired_rubi_delta_with_nic",
+    "p_paired_rubi_delta_nic_kinetics",
+    "p_nic_vs_rubi_difference",
+    "p_nic_vs_rubi_kinetics",
+    "p_all_means_without_no_light",
+    "p_glutathione_vs_rubi_no_light",
+    "p_h2o2_conditions",
+    "p_rubi_no_light_vs_h2o2",
+    "p_rubi_no_light_vs_h2o2_kinetics"
+  )
+
+  for (plot_name in key_plot_names) {
+    if (exists(plot_name, envir = .GlobalEnv)) {
+      show_plot(get(plot_name, envir = .GlobalEnv), inline = TRUE)
+    }
+  }
+}
+```
 
 
