@@ -2699,11 +2699,9 @@ if (nrow(rubi_no_light_region_norm)) {
 
 Кластеризацію за всією формою кривої перенесено до
 `trachea_2025_legacy_whole_curve_clustering.Rmd`; в основному аналізі
-використовується лише експериментально визначене вікно 420-540 с.
-
-```{r disable_whole_curve_clustering, include=FALSE}
-whole_curve_rubi_clusters_enabled <- FALSE
-```
+використовується лише експериментально визначене вікно 420-540 с. Архівний
+файл не підключається і не виконується автоматично; він потрібен тільки для
+відтворення попередньої exploratory-перевірки.
 
 ### Попарний аналіз і кластеризація у вікні світла
 
@@ -4202,158 +4200,11 @@ p_rubi_mean_delta_only <- add_nicotine_to_delta_plot(
 )
 ```
 
-### Порівняння nicotine з підгрупами RuBi-Nicotine
+### Попарна Δ та підсумкові графіки nicotine
 
-```{r nicotine_cluster_comparisons, fig.width=10, fig.height=6}
-# Підгрупи визначені лише за характеристиками в зоні опромінення
-# 420-540 с; функції формують для кожної підгрупи Δ та її кінетику.
-
-if (!exists("cluster_label_slug")) {
-  cluster_label_slug <- function(x) {
-    dplyr::case_when(
-      x == "Вища відповідь" ~ "higher_response",
-      x == "Нижча відповідь" ~ "lower_response",
-      x == "Висока тривала відповідь" ~ "high_sustained_response",
-      x == "Помірна тривала відповідь" ~ "moderate_sustained_response",
-      x == "Рання/транзиторна відповідь" ~ "early_transient_response",
-      TRUE ~ gsub("[^A-Za-z0-9]+", "_", x)
-    )
-  }
-}
-
-make_light_cluster_delta_with_nic_plots <- function(light_clusters,
-                                                    n_clusters,
-                                                    cluster_colors) {
-  cluster_order <- names(cluster_colors)
-  cluster_order <- cluster_order[cluster_order %in% unique(light_clusters$mean$ClusterLabel)]
-
-  plots <- lapply(cluster_order, function(cluster_label) {
-    light_d <- light_clusters$mean %>%
-      dplyr::filter(ClusterLabel == cluster_label)
-    no_light_d <- rubi_no_light_mean
-
-    start_time <- max(min(light_d$TimeRubi), min(no_light_d$TimeRubi))
-    end_time <- min(max(light_d$TimeRubi), max(no_light_d$TimeRubi))
-    dt <- median(c(diff(light_d$TimeRubi), diff(no_light_d$TimeRubi)), na.rm = TRUE)
-    if (!is.finite(dt) || dt <= 0 || end_time <= start_time) return(NULL)
-
-    grid <- seq(start_time, end_time, by = dt)
-    delta_d <- make_independent_mean_delta(light_d, no_light_d, grid)
-    delta_d$Delta <- delta_d$Mean
-    delta_d$ClusterLabel <- cluster_label
-
-    n_light <- light_clusters$features %>%
-      dplyr::filter(ClusterLabel == cluster_label) %>%
-      dplyr::pull(Curve) %>%
-      dplyr::n_distinct()
-    n_no_light <- dplyr::n_distinct(rubi_no_light_norm$Curve)
-
-    p <- ggplot(delta_d, aes(TimeRubi, Delta)) +
-      light_band_layer() +
-      geom_hline(yintercept = 0, color = "grey75", linewidth = 0.5) +
-      geom_ribbon(
-        aes(ymin = CI_low, ymax = CI_high),
-        fill = condition_color("rubi_light - rubi_no_light"),
-        alpha = 0.14,
-        color = NA
-      ) +
-      geom_line(color = condition_color("rubi_light - rubi_no_light"),
-                linewidth = 1.35) +
-      labs(
-        title = paste0(
-          "Δ підгрупи опроміненого RuBi-Nicotine з nicotine: ",
-          cluster_label
-        ),
-        subtitle = paste0(
-          n_clusters,
-          " підгрупи; n опроміненого = ", n_light,
-          ", n неопроміненого = ", n_no_light,
-          "; Δ = опромінений - неопромінений; CI через поширення SEM незалежних середніх; nicotine пунктиром"
-        ),
-        x = "Час від початку відповіді, с",
-        y = "Δ середньої нормованої відповіді"
-      ) +
-      presentation_theme() +
-      axes_from_origin(delta_d, "TimeRubi")
-    add_nicotine_to_delta_plot(p, delta_d)
-  })
-  names(plots) <- cluster_label_slug(cluster_order)
-  plots[!vapply(plots, is.null, logical(1))]
-}
-
-make_light_cluster_delta_nic_kinetics_plots <- function(light_clusters,
-                                                        n_clusters,
-                                                        cluster_colors) {
-  cluster_order <- names(cluster_colors)
-  cluster_order <- cluster_order[cluster_order %in% unique(light_clusters$mean$ClusterLabel)]
-
-  plots <- lapply(cluster_order, function(cluster_label) {
-    light_d <- light_clusters$mean %>%
-      dplyr::filter(ClusterLabel == cluster_label)
-    no_light_d <- rubi_no_light_mean
-
-    start_time <- max(min(light_d$TimeRubi), min(no_light_d$TimeRubi))
-    end_time <- min(max(light_d$TimeRubi), max(no_light_d$TimeRubi))
-    dt <- median(c(diff(light_d$TimeRubi), diff(no_light_d$TimeRubi)), na.rm = TRUE)
-    if (!is.finite(dt) || dt <= 0 || end_time <= start_time) return(NULL)
-
-    grid <- seq(start_time, end_time, by = dt)
-    light_y <- approx(light_d$TimeRubi, light_d$Mean,
-                      xout = grid, rule = 1, ties = mean)$y
-    no_light_y <- approx(no_light_d$TimeRubi, no_light_d$Mean,
-                         xout = grid, rule = 1, ties = mean)$y
-    delta_d <- data.frame(
-      TimeRubi = grid,
-      Mean = light_y - no_light_y,
-      ClusterLabel = cluster_label
-    )
-
-    n_light <- light_clusters$features %>%
-      dplyr::filter(ClusterLabel == cluster_label) %>%
-      dplyr::pull(Curve) %>%
-      dplyr::n_distinct()
-    n_no_light <- dplyr::n_distinct(rubi_no_light_norm$Curve)
-    delta_nic_d <- make_delta_nic_data(delta_d)
-    make_delta_nic_kinetics_plot(
-      delta_nic_d,
-      title = paste0("Кінетика Δ підгрупи RuBi-Nicotine: ", cluster_label),
-      subtitle = paste0(
-        n_clusters,
-        " підгрупи; n опроміненого = ", n_light,
-        ", n неопроміненого = ", n_no_light,
-        "; nicotine підйом на 420 с"
-      )
-    )$plot
-  })
-  names(plots) <- cluster_label_slug(cluster_order)
-  plots[!vapply(plots, is.null, logical(1))]
-}
-
-if (isTRUE(whole_curve_rubi_clusters_enabled) &&
-    exists("rubi_light_clusters_2") && exists("rubi_light_clusters_3") &&
-    exists("cluster_colors_2") && exists("cluster_colors_3")) {
-  rubi_light_cluster_delta_with_nic_plots_2 <- make_light_cluster_delta_with_nic_plots(
-    rubi_light_clusters_2,
-    n_clusters = 2,
-    cluster_colors = cluster_colors_2
-  )
-  rubi_light_cluster_delta_with_nic_plots_3 <- make_light_cluster_delta_with_nic_plots(
-    rubi_light_clusters_3,
-    n_clusters = 3,
-    cluster_colors = cluster_colors_3
-  )
-  rubi_light_cluster_delta_nic_kinetics_plots_2 <- make_light_cluster_delta_nic_kinetics_plots(
-    rubi_light_clusters_2,
-    n_clusters = 2,
-    cluster_colors = cluster_colors_2
-  )
-  rubi_light_cluster_delta_nic_kinetics_plots_3 <- make_light_cluster_delta_nic_kinetics_plots(
-    rubi_light_clusters_3,
-    n_clusters = 3,
-    cluster_colors = cluster_colors_3
-  )
-}
-
+```{r nicotine_paired_and_outputs, fig.width=10, fig.height=6}
+# Додаємо nicotine до попарної Δ, після чого виводимо й зберігаємо
+# актуальні загальні, попарні та y420-порівняння.
 if (exists("paired_rubi_delta") && exists("paired_rubi_delta_mean")) {
   p_paired_rubi_delta_with_nic <- ggplot(
     paired_rubi_delta,
@@ -4445,22 +4296,6 @@ show_plot(p_rubi_light_no_light_difference)
 show_plot(p_rubi_mean_delta_only)
 if (exists("p_paired_rubi_delta_with_nic")) show_plot(p_paired_rubi_delta_with_nic)
 if (exists("p_paired_rubi_delta_nic_kinetics")) show_plot(p_paired_rubi_delta_nic_kinetics)
-if (isTRUE(whole_curve_rubi_clusters_enabled) &&
-    exists("rubi_light_cluster_delta_with_nic_plots_2")) {
-  for (p in rubi_light_cluster_delta_with_nic_plots_2) show_plot(p)
-}
-if (isTRUE(whole_curve_rubi_clusters_enabled) &&
-    exists("rubi_light_cluster_delta_with_nic_plots_3")) {
-  for (p in rubi_light_cluster_delta_with_nic_plots_3) show_plot(p)
-}
-if (isTRUE(whole_curve_rubi_clusters_enabled) &&
-    exists("rubi_light_cluster_delta_nic_kinetics_plots_2")) {
-  for (p in rubi_light_cluster_delta_nic_kinetics_plots_2) show_plot(p)
-}
-if (isTRUE(whole_curve_rubi_clusters_enabled) &&
-    exists("rubi_light_cluster_delta_nic_kinetics_plots_3")) {
-  for (p in rubi_light_cluster_delta_nic_kinetics_plots_3) show_plot(p)
-}
 show_plot(p_nic_vs_rubi_difference)
 show_plot(p_nic_vs_rubi_kinetics)
 show_plot(p_experimental_delta_nic_metrics)
@@ -4494,46 +4329,6 @@ if (exists("p_paired_rubi_delta_nic_kinetics")) {
     "rubi_comparison/1_no_subgroups",
     "paired_rubi_light_minus_no_light_delta_with_nic_kinetics"
   )
-}
-if (isTRUE(whole_curve_rubi_clusters_enabled) &&
-    exists("rubi_light_cluster_delta_with_nic_plots_2")) {
-  for (nm in names(rubi_light_cluster_delta_with_nic_plots_2)) {
-    save_group_plot(
-      rubi_light_cluster_delta_with_nic_plots_2[[nm]],
-      "rubi_comparison/2_subgroups",
-      paste0("rubi_light_subgroup_minus_no_light_mean_delta_with_nic_2_groups_", nm)
-    )
-  }
-}
-if (isTRUE(whole_curve_rubi_clusters_enabled) &&
-    exists("rubi_light_cluster_delta_with_nic_plots_3")) {
-  for (nm in names(rubi_light_cluster_delta_with_nic_plots_3)) {
-    save_group_plot(
-      rubi_light_cluster_delta_with_nic_plots_3[[nm]],
-      "rubi_comparison/3_subgroups",
-      paste0("rubi_light_subgroup_minus_no_light_mean_delta_with_nic_3_groups_", nm)
-    )
-  }
-}
-if (isTRUE(whole_curve_rubi_clusters_enabled) &&
-    exists("rubi_light_cluster_delta_nic_kinetics_plots_2")) {
-  for (nm in names(rubi_light_cluster_delta_nic_kinetics_plots_2)) {
-    save_group_plot(
-      rubi_light_cluster_delta_nic_kinetics_plots_2[[nm]],
-      "rubi_comparison/2_subgroups",
-      paste0("rubi_light_subgroup_minus_no_light_delta_with_nic_kinetics_2_groups_", nm)
-    )
-  }
-}
-if (isTRUE(whole_curve_rubi_clusters_enabled) &&
-    exists("rubi_light_cluster_delta_nic_kinetics_plots_3")) {
-  for (nm in names(rubi_light_cluster_delta_nic_kinetics_plots_3)) {
-    save_group_plot(
-      rubi_light_cluster_delta_nic_kinetics_plots_3[[nm]],
-      "rubi_comparison/3_subgroups",
-      paste0("rubi_light_subgroup_minus_no_light_delta_with_nic_kinetics_3_groups_", nm)
-    )
-  }
 }
 save_group_plot(
   p_nic_vs_rubi_difference,
