@@ -10,6 +10,8 @@ Rplots.pdf
 data/*
 !data/09.2025/
 !data/09.2025/**
+!data/experiment protocols/
+!data/experiment protocols/**
 
 # Рисунки генеруються з Rmd і не зберігаються у Git.
 figs/
