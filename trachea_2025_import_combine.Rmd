@@ -1231,11 +1231,17 @@ time_to_seconds <- function(df, source = "невідомий файл") {
 # Послідовно зсуває Time кожного файла й зшиває їх в один запис.
 combine_with_shift <- function(dflist, gap_seconds = 0.04) {
   shift <- 0
-  shifted <- lapply(dflist, function(df) {
+  shifted <- vector("list", length(dflist))
+
+  # Тут потрібен звичайний цикл: shift після кожного файла має зберігатися
+  # для наступної ітерації. Локальне `<-` усередині lapply цього не робить.
+  for (i in seq_along(dflist)) {
+    df <- dflist[[i]]
     df$Time <- df$Time + shift
     shift <- max(df$Time) + gap_seconds
-    df
-  })
+    shifted[[i]] <- df
+  }
+
   dplyr::bind_rows(shifted)
 }
 
@@ -1305,7 +1311,11 @@ for (k in names(grouped)) {
 
   for (i in seq_along(subgroups)) {
     combined_name <- paste0("data_", k, "_", i)
-    assign(combined_name, combine_with_shift(subgroups[[i]]))
+    combined <- combine_with_shift(subgroups[[i]])
+    if (is.unsorted(combined$Time, strictly = FALSE)) {
+      stop("Після об'єднання порушено порядок часу у ", combined_name)
+    }
+    assign(combined_name, combined)
     combined_vars <- c(combined_vars, combined_name)
     combined_sources[[combined_name]] <- names(subgroups[[i]])
   }
